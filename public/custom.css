@@ -1,0 +1,73 @@
+/* MeowDev 群聊界面 — 简洁风格 */
+
+/* ── 全局 ───────────────────────────────────── */
+
+/* 简洁的字体 */
+body {
+  font-family: -apple-system, "PingFang SC", "Noto Sans SC", "Helvetica Neue", sans-serif !important;
+}
+
+/* ── 暗色主题修复 ────────────────────────────── */
+
+/* 表格在暗色主题下的显示 */
+table {
+  border-collapse: collapse;
+  width: 100%;
+  margin: 0.5em 0;
+}
+
+table th,
+table td {
+  padding: 6px 12px;
+  text-align: left;
+}
+
+/* 暗色主题表格 */
+[data-theme="dark"] table,
+[data-theme="dark"] table th,
+[data-theme="dark"] table td {
+  border-color: rgba(255, 255, 255, 0.12) !important;
+  color: rgba(255, 255, 255, 0.87) !important;
+}
+
+[data-theme="dark"] table th {
+  background: rgba(255, 255, 255, 0.08) !important;
+  color: rgba(255, 255, 255, 0.87) !important;
+}
+
+[data-theme="dark"] table tr:nth-child(even) {
+  background: rgba(255, 255, 255, 0.03) !important;
+}
+
+/* 暗色主题代码块 */
+[data-theme="dark"] pre {
+  border-color: rgba(255, 255, 255, 0.1) !important;
+}
+
+/* 暗色主题下所有文字确保可见 */
+[data-theme="dark"] .MuiTypography-root,
+[data-theme="dark"] p,
+[data-theme="dark"] li,
+[data-theme="dark"] span {
+  color: inherit !important;
+}
+
+/* ── 消息气泡简化 ────────────────────────────── */
+
+/* 减少消息间距，更紧凑的群聊感 */
+.step-container {
+  margin-bottom: 4px !important;
+}
+
+/* 代码块简洁 */
+pre {
+  border-radius: 6px !important;
+  font-size: 13px !important;
+}
+
+/* 分割线简化 */
+hr {
+  border: none;
+  border-top: 1px solid rgba(128, 128, 128, 0.2);
+  margin: 8px 0;
+}

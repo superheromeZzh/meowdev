@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# 项目
+.env
+meowdev.db
+
+# output/ 作为独立 Git 仓库管理（猫猫的产出代码）
+output/
+
+# Chainlit
+.chainlit/translations/
