@@ -135,34 +135,39 @@ class MeowDevTeam:
                 await on_system(phase, content)
 
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        # 阶段 0: 圆桌讨论 — 三只猫猫各抒己见
+        # 阶段 0: 圆桌讨论 — 三只猫猫各抒己见、互相评价
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         session.current_phase = Phase.DISCUSS
-        await system_msg(Phase.DISCUSS, "**💬 圆桌讨论**\n---")
+        await system_msg(Phase.DISCUSS,
+            "**💬 圆桌讨论** — 三只猫猫各抒己见\n---")
 
         for cat in [self.arch, self.stack, self.pixel]:
             await cat_speak(
                 cat, Phase.DISCUSS,
                 f"用户提出了一个开发需求：「{requirement}」\n"
-                f"请从你的专业角度（{cat.role}）简短发表看法（3-5句）。",
+                f"请从你的专业角度（{cat.role}）发表看法，"
+                f"包括你觉得这个需求的关键点、技术挑战、以及你的初步方案（3-5句）。",
             )
 
+        # 第二轮：互相回应，形成讨论
         for cat in [self.stack, self.pixel]:
             await cat_speak(
                 cat, Phase.DISCUSS,
-                "听了其他猫猫的看法，你有什么补充或不同意见？简短回应即可（2-3句）。",
+                "听了其他猫猫的看法，你有什么补充或不同意见？"
+                "可以直接引用他们的观点来讨论（2-3句）。",
             )
 
         await cat_speak(
             self.arch, Phase.DISCUSS,
-            "综合大家的讨论，简短总结一下最终方案方向（2-3句）。",
+            "综合大家的讨论，总结最终方案方向。如果有分歧，给出你的裁决（3-5句）。",
         )
 
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         # 阶段 1: Arch酱 输出架构方案
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         session.current_phase = Phase.ANALYZE
-        await system_msg(Phase.ANALYZE, "**📐 架构设计**\n---")
+        await system_msg(Phase.ANALYZE,
+            "**📐 架构设计** — Arch酱 主导\n---")
 
         await cat_speak(
             self.arch, Phase.ANALYZE,
@@ -171,23 +176,28 @@ class MeowDevTeam:
 
         await cat_speak(
             self.stack, Phase.ANALYZE,
-            "看了 Arch酱 的架构方案，从实现角度简短说说你的看法（2-3句）。",
+            "看了 Arch酱 的架构方案，从实现角度说说：\n"
+            "1. 有没有实现上的难点？\n"
+            "2. 你打算怎么分步实现？（2-3句）",
         )
 
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         # 阶段 2: Pixel咪 设计 UI
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         session.current_phase = Phase.DESIGN
-        await system_msg(Phase.DESIGN, "**🎨 UI 设计**\n---")
+        await system_msg(Phase.DESIGN,
+            "**🎨 UI 设计** — Pixel咪 主导\n---")
 
         await cat_speak(
             self.pixel, Phase.DESIGN,
-            "根据架构方案设计 UI 方案，包含配色（色值）、布局、关键交互。",
+            "根据架构方案设计 UI 方案，包含配色（色值）、布局、关键交互、组件设计。",
         )
 
         await cat_speak(
             self.stack, Phase.DESIGN,
-            "看了 Pixel咪 的 UI 设计方案，从实现角度简短说说有没有难点（1-2句）。",
+            "看了 Pixel咪 的 UI 设计方案，从实现角度说说：\n"
+            "1. 这个 UI 方案实现起来有没有难点？\n"
+            "2. 有没有更好的前端组件方案？（2-3句）",
         )
 
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -211,7 +221,8 @@ class MeowDevTeam:
         # 阶段 3: Stack喵 编写代码
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         session.current_phase = Phase.CODE
-        await system_msg(Phase.CODE, "**💻 开始编码**\n---")
+        await system_msg(Phase.CODE,
+            "**💻 开始编码** — Stack喵 主导\n---")
 
         await cat_speak(
             self.stack, Phase.CODE,
@@ -245,7 +256,8 @@ class MeowDevTeam:
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         # 阶段 4: 代码审查（循环）
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        await system_msg(Phase.REVIEW_CODE, "**📝 代码审查**\n---")
+        await system_msg(Phase.REVIEW_CODE,
+            "**📝 代码审查** — Arch酱 主导\n---")
 
         for round_num in range(1, MAX_REVIEW_ROUNDS + 1):
             session.current_phase = Phase.REVIEW_CODE

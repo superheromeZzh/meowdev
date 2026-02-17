@@ -32,8 +32,13 @@ CAT_CONFIGS = {
         "role": "首席架构师",
         "avatar": "arch.png",
         "prompt_file": PROMPTS_DIR / "arch.txt",
-        # Claude Code CLI: -p 模式下无 prompt 参数时自动从 stdin 读取
-        "cli_cmd": ["claude", "-p", "--output-format", "text", "--no-session-persistence"],
+        # Claude Code CLI: 跳过权限确认，让 Arch酱 能自主执行 git/文件操作
+        "cli_cmd": [
+            "claude", "-p",
+            "--output-format", "text",
+            "--no-session-persistence",
+            "--dangerously-skip-permissions",
+        ],
         "description": "高冷严谨的架构师，负责需求分析和代码审查",
     },
     "stack": {
@@ -42,10 +47,8 @@ CAT_CONFIGS = {
         "role": "全栈工程师",
         "avatar": "stack.png",
         "prompt_file": PROMPTS_DIR / "stack.txt",
-        # Codex CLI: prompt 通过 stdin 传入（- 表示从 stdin 读取）
-        "cli_cmd": ["codex", "exec", "--skip-git-repo-check", "-"],
-        # 全自动模式（可直接写文件）
-        "cli_cmd_full_auto": ["codex", "exec", "--skip-git-repo-check", "--full-auto", "-"],
+        # Codex CLI: --full-auto 让 Stack喵 能自主写文件、执行命令
+        "cli_cmd": ["codex", "exec", "--skip-git-repo-check", "--full-auto", "-"],
         "description": "热情话痨的全栈工程师，负责代码实现",
     },
     "pixel": {
@@ -71,8 +74,35 @@ CLI_TIMEOUT = 600
 # 流式输出刷新间隔（秒）
 STREAM_INTERVAL = 0.1
 
+# ── 工作循环安全上限 ──────────────────────────────────────
+# 猫猫们持续工作直到任务做完，此值仅做极端情况的安全兜底
+MAX_WORK_ROUNDS = 100
+
+# ── Stack喵 额度降级配置 ──────────────────────────────────
+# 当 Stack喵(codex) 额度耗尽时，由 Arch酱(claude) 临时代劳
+
+FALLBACK_CLI = {
+    "stack": {
+        "cli_cmd": [
+            "claude", "-p",
+            "--output-format", "text",
+            "--no-session-persistence",
+            "--dangerously-skip-permissions",
+        ],
+        "helper_name": "Arch酱",
+    },
+}
+
+# 额度错误的关键词检测
+QUOTA_ERROR_KEYWORDS = [
+    "rate limit", "rate_limit", "quota", "exceeded", "429",
+    "too many requests", "limit reached", "usage limit",
+    "billing", "insufficient", "credits", "budget",
+    "capacity", "overloaded", "spending limit",
+]
+
 # ── Git / GitHub 配置 ────────────────────────────────────
 
 GIT_MAIN_BRANCH = "main"
-PR_AUTO_MERGE = False        # 是否跳过用户确认自动合并
+PR_AUTO_MERGE = True        # 是否跳过用户确认自动合并
 BRANCH_PREFIX = "feat/"      # feature 分支前缀

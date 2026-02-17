@@ -40,9 +40,14 @@ async def _run(
 
 
 async def ensure_git_repo(cwd: str) -> bool:
-    """确保目录是一个 git 仓库，不是则执行 git init。返回是否新创建。"""
-    rc, _, _ = await _run(["git", "rev-parse", "--is-inside-work-tree"], cwd)
-    if rc == 0:
+    """确保目录有自己的 .git（独立仓库），不是则执行 git init。返回是否新创建。
+
+    注意：即使 cwd 位于父级仓库内部，仍会在 cwd 下创建独立 .git，
+    这样 output/ 可以有自己的分支和 PR 流程。
+    """
+    import os
+    git_dir = os.path.join(cwd, ".git")
+    if os.path.isdir(git_dir):
         return False
     rc, _, err = await _run(["git", "init"], cwd)
     if rc != 0:
@@ -70,15 +75,18 @@ async def create_github_repo(name: str, cwd: str, private: bool = False) -> str:
 
 async def setup_repo_for_pr(cwd: str, repo_name: str = "meowdev-output") -> str:
     """
-    确保目录可以走 PR 流程：git init + 初始 commit + GitHub remote。
+    确保目录可以走 PR 流程：git init + 主分支重命名 + 初始 commit + GitHub remote。
     返回 remote URL（如果成功），空字符串表示无远程。
     """
-    await ensure_git_repo(cwd)
+    is_new = await ensure_git_repo(cwd)
+
+    # 新仓库：把默认分支重命名为 main
+    if is_new:
+        await _run(["git", "branch", "-m", GIT_MAIN_BRANCH], cwd)
 
     # 确保至少有一次 commit（否则无法创建分支）
     rc, _, _ = await _run(["git", "rev-parse", "HEAD"], cwd)
     if rc != 0:
-        # 没有任何 commit，创建初始 commit
         await _run(["git", "add", "-A"], cwd)
         rc, _, err = await _run(
             ["git", "commit", "--allow-empty", "-m", "init: meowdev workspace"],
