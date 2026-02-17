@@ -19,7 +19,6 @@ from memory import (
     format_cat_memory_context,
     format_chat_context,
     format_user_profile_context,
-    set_user_info,
 )
 
 
