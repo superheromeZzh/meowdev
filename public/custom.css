@@ -71,3 +71,38 @@ hr {
   border-top: 1px solid rgba(128, 128, 128, 0.2);
   margin: 8px 0;
 }
+
+/* ── 头像放大 ───────────────────────────────────── */
+
+/* Chainlit 2.x 头像修复
+ * 问题：父容器 span.h-5.w-5 限制了 20px
+ * 解决：使用 :where 绕过 Tailwind 优先级
+ */
+
+/* 方法1: 使用高特异性选择器 */
+body span.relative.flex.shrink-0.overflow-hidden.rounded-full.h-5.w-5,
+body span[class*="rounded-full"][class*="h-5"][class*="w-5"],
+html body span.rounded-full.h-5.w-5 {
+  width: 56px !important;
+  height: 56px !important;
+  min-width: 56px !important;
+  min-height: 56px !important;
+}
+
+/* 方法2: 覆盖 Tailwind 的 w-5 h-5 工具类（在头像上下文中） */
+span.rounded-full.w-5,
+span.rounded-full.h-5,
+span.overflow-hidden.w-5,
+span.overflow-hidden.h-5 {
+  width: 56px !important;
+  height: 56px !important;
+}
+
+/* 方法3: 直接针对头像图片 */
+img[src*="/avatars/"] {
+  width: 56px !important;
+  height: 56px !important;
+  min-width: 56px !important;
+  min-height: 56px !important;
+  object-fit: cover !important;
+}

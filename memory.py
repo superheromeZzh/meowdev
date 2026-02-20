@@ -1,10 +1,21 @@
 """
-记忆系统 —— 让猫猫们记住你
+记忆系统 —— SQLite 实现
 
-三层记忆：
-1. 对话历史（chat_history）—— 群聊中所有人的发言记录
-2. 猫猫记忆（cat_memories）—— 每只猫猫对用户的个性化记忆
-3. 用户画像（user_profile）—— 跨猫猫共享的用户信息
+包含：
+- 对话历史（chat_history）
+- 猫猫个性化记忆（cat_memories）
+- 用户画像（user_profile）
+
+查看记忆的方式：
+1. 命令行查看 SQLite：
+   sqlite3 meowdev.db "SELECT * FROM cat_memories WHERE cat_id='arch';"
+   sqlite3 meowdev.db "SELECT * FROM user_profile;"
+   sqlite3 meowdev.db "SELECT * FROM chat_history ORDER BY timestamp DESC LIMIT 20;"
+
+2. Python 查看：
+   import sqlite3
+   conn = sqlite3.connect('meowdev.db')
+   for row in conn.execute("SELECT * FROM cat_memories"): print(row)
 """
 
 import sqlite3
@@ -14,9 +25,7 @@ from typing import Optional
 from config import BASE_DIR
 
 DB_PATH = BASE_DIR / "meowdev.db"
-
 MAX_RECENT_MESSAGES = 30
-MAX_CAT_MEMORIES = 50
 
 
 def _get_conn() -> sqlite3.Connection:
@@ -28,36 +37,54 @@ def _get_conn() -> sqlite3.Connection:
 
 def init_db():
     conn = _get_conn()
-    conn.executescript("""
+
+    # 对话历史表
+    conn.execute("""
         CREATE TABLE IF NOT EXISTS chat_history (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
             role        TEXT NOT NULL,
             content     TEXT NOT NULL,
             timestamp   REAL NOT NULL,
             session_id  TEXT DEFAULT 'default'
-        );
+        )
+    """)
 
+    # 猫猫记忆表
+    conn.execute("""
         CREATE TABLE IF NOT EXISTS cat_memories (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
             cat_id      TEXT NOT NULL,
             memory      TEXT NOT NULL,
             importance  INTEGER DEFAULT 1,
             timestamp   REAL NOT NULL
-        );
+        )
+    """)
 
+    # 用户画像表
+    conn.execute("""
         CREATE TABLE IF NOT EXISTS user_profile (
             key         TEXT PRIMARY KEY,
             value       TEXT NOT NULL,
             updated_at  REAL NOT NULL
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_history_session ON chat_history(session_id, timestamp);
-        CREATE INDEX IF NOT EXISTS idx_memories_cat ON cat_memories(cat_id, importance DESC);
+        )
     """)
+
+    # 创建索引
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_history_session
+        ON chat_history(session_id, timestamp)
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_cat_memories_cat
+        ON cat_memories(cat_id, importance DESC)
+    """)
+
     conn.close()
 
 
-# ── 对话历史 ─────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════
+# 对话历史
+# ═══════════════════════════════════════════════════════════════════════
 
 def add_message(role: str, content: str, session_id: str = "default"):
     conn = _get_conn()
@@ -78,49 +105,119 @@ def get_recent_messages(session_id: str = "default",
         (session_id, limit),
     ).fetchall()
     conn.close()
-    return [{"role": r["role"], "content": r["content"]} for r in reversed(rows)]
+    return [{"role": r["role"], "content": r["content"], "timestamp": r["timestamp"]} for r in reversed(rows)]
 
 
-# ── 猫猫记忆 ─────────────────────────────────────────────
+def get_messages_paginated(session_id: str = "default",
+                           offset: int = 0,
+                           limit: int = 20) -> list[dict]:
+    """分页获取历史消息（按时间倒序，返回时正序显示）"""
+    conn = _get_conn()
+    rows = conn.execute(
+        "SELECT role, content, timestamp FROM chat_history "
+        "WHERE session_id = ? ORDER BY timestamp DESC LIMIT ? OFFSET ?",
+        (session_id, limit, offset),
+    ).fetchall()
+    conn.close()
+    return [{"role": r["role"], "content": r["content"], "timestamp": r["timestamp"]} for r in reversed(rows)]
+
+
+def get_message_count(session_id: str = "default") -> int:
+    """获取消息总数"""
+    conn = _get_conn()
+    row = conn.execute(
+        "SELECT COUNT(*) as count FROM chat_history WHERE session_id = ?",
+        (session_id,),
+    ).fetchone()
+    conn.close()
+    return row["count"] if row else 0
+
+
+def format_chat_context(session_id: str = "default") -> str:
+    """格式化对话历史，给 LLM 用"""
+    messages = get_recent_messages(session_id)
+    if not messages:
+        return ""
+    return "\n".join(f"{m['role']}：{m['content']}" for m in messages)
+
+
+def clear_session(session_id: str = "default"):
+    """清空会话历史"""
+    conn = _get_conn()
+    conn.execute("DELETE FROM chat_history WHERE session_id = ?", (session_id,))
+    conn.commit()
+    conn.close()
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 猫猫记忆
+# ═══════════════════════════════════════════════════════════════════════
 
 def add_cat_memory(cat_id: str, memory: str, importance: int = 1):
+    """添加猫猫记忆
+
+    Args:
+        cat_id: 猫猫ID (arch/stack/pixel)
+        memory: 记忆内容
+        importance: 重要性 (1=普通, 2=重要, 3=非常重要)
+    """
     conn = _get_conn()
-    existing = conn.execute(
-        "SELECT id FROM cat_memories WHERE cat_id = ? AND memory = ?",
-        (cat_id, memory),
-    ).fetchone()
-    if existing:
-        conn.execute(
-            "UPDATE cat_memories SET importance = MIN(importance + 1, 5), timestamp = ? WHERE id = ?",
-            (time.time(), existing["id"]),
-        )
-    else:
-        conn.execute(
-            "INSERT INTO cat_memories (cat_id, memory, importance, timestamp) VALUES (?, ?, ?, ?)",
-            (cat_id, memory, importance, time.time()),
-        )
     conn.execute(
-        "DELETE FROM cat_memories WHERE cat_id = ? AND id NOT IN "
-        "(SELECT id FROM cat_memories WHERE cat_id = ? ORDER BY importance DESC, timestamp DESC LIMIT ?)",
-        (cat_id, cat_id, MAX_CAT_MEMORIES),
+        "INSERT INTO cat_memories (cat_id, memory, importance, timestamp) VALUES (?, ?, ?, ?)",
+        (cat_id, memory, importance, time.time()),
     )
     conn.commit()
     conn.close()
 
 
-def get_cat_memories(cat_id: str, limit: int = 10) -> list[str]:
+def get_cat_memories(cat_id: str, limit: int = 20) -> list[dict]:
+    """获取猫猫的记忆列表"""
     conn = _get_conn()
     rows = conn.execute(
-        "SELECT memory FROM cat_memories WHERE cat_id = ? ORDER BY importance DESC, timestamp DESC LIMIT ?",
+        "SELECT memory, importance, timestamp FROM cat_memories "
+        "WHERE cat_id = ? ORDER BY importance DESC, timestamp DESC LIMIT ?",
         (cat_id, limit),
     ).fetchall()
     conn.close()
-    return [r["memory"] for r in rows]
+    return [{"memory": r["memory"], "importance": r["importance"]} for r in rows]
 
 
-# ── 用户画像 ─────────────────────────────────────────────
+def format_cat_memory_context(cat_id: str, limit: int = 10) -> str:
+    """格式化猫猫记忆，给 LLM 用"""
+    memories = get_cat_memories(cat_id, limit)
+    if not memories:
+        return ""
+
+    lines = []
+    for m in memories:
+        prefix = "★" if m["importance"] >= 2 else "•"
+        lines.append(f"{prefix} {m['memory']}")
+
+    return "\n".join(lines)
+
+
+def clear_cat_memories(cat_id: Optional[str] = None):
+    """清空猫猫记忆，不传 cat_id 则清空所有"""
+    conn = _get_conn()
+    if cat_id:
+        conn.execute("DELETE FROM cat_memories WHERE cat_id = ?", (cat_id,))
+    else:
+        conn.execute("DELETE FROM cat_memories")
+    conn.commit()
+    conn.close()
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 用户画像
+# ═══════════════════════════════════════════════════════════════════════
 
 def set_user_info(key: str, value: str):
+    """设置用户信息
+
+    Args:
+        key: 信息类型 (如 name, preference, project 等)
+        value: 信息内容
+    """
     conn = _get_conn()
     conn.execute(
         "INSERT OR REPLACE INTO user_profile (key, value, updated_at) VALUES (?, ?, ?)",
@@ -131,40 +228,88 @@ def set_user_info(key: str, value: str):
 
 
 def get_user_info(key: str) -> Optional[str]:
+    """获取用户信息"""
     conn = _get_conn()
-    row = conn.execute("SELECT value FROM user_profile WHERE key = ?", (key,)).fetchone()
+    row = conn.execute(
+        "SELECT value FROM user_profile WHERE key = ?", (key,)
+    ).fetchone()
     conn.close()
     return row["value"] if row else None
 
 
-def get_all_user_info() -> dict[str, str]:
+def get_all_user_info() -> dict:
+    """获取所有用户信息"""
     conn = _get_conn()
     rows = conn.execute("SELECT key, value FROM user_profile").fetchall()
     conn.close()
     return {r["key"]: r["value"] for r in rows}
 
 
-# ── 格式化（给 LLM 用）─────────────────────────────────
-
-def format_chat_context(session_id: str = "default") -> str:
-    messages = get_recent_messages(session_id)
-    if not messages:
-        return ""
-    return "\n".join(f"{m['role']}：{m['content']}" for m in messages)
-
-
-def format_cat_memory_context(cat_id: str) -> str:
-    memories = get_cat_memories(cat_id)
-    if not memories:
-        return ""
-    return "你记得关于用户的这些事：\n" + "\n".join(f"- {m}" for m in memories)
-
-
 def format_user_profile_context() -> str:
-    info = get_all_user_info()
-    if not info:
+    """格式化用户画像，给 LLM 用"""
+    profile = get_all_user_info()
+    if not profile:
         return ""
-    return "用户信息：\n" + "\n".join(f"- {k}: {v}" for k, v in info.items())
+
+    lines = ["用户画像"]
+    for key, value in profile.items():
+        lines.append(f"- {key}: {value}")
+
+    return "\n".join(lines)
 
 
+def clear_user_profile():
+    """清空用户画像"""
+    conn = _get_conn()
+    conn.execute("DELETE FROM user_profile")
+    conn.commit()
+    conn.close()
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 调试工具
+# ═══════════════════════════════════════════════════════════════════════
+
+def print_all_memories():
+    """打印所有记忆（调试用）"""
+    conn = _get_conn()
+
+    print("\n=== 猫猫记忆 ===")
+    rows = conn.execute(
+        "SELECT cat_id, memory, importance FROM cat_memories ORDER BY cat_id, importance DESC"
+    ).fetchall()
+    if rows:
+        for r in rows:
+            print(f"  [{r['cat_id']}] ({r['importance']}) {r['memory']}")
+    else:
+        print("  (空)")
+
+    print("\n=== 用户画像 ===")
+    rows = conn.execute("SELECT key, value FROM user_profile").fetchall()
+    if rows:
+        for r in rows:
+            print(f"  {r['key']}: {r['value']}")
+    else:
+        print("  (空)")
+
+    print("\n=== 最近对话 ===")
+    rows = conn.execute(
+        "SELECT role, content FROM chat_history ORDER BY timestamp DESC LIMIT 10"
+    ).fetchall()
+    if rows:
+        for r in reversed(rows):
+            content = r['content'][:50] + "..." if len(r['content']) > 50 else r['content']
+            print(f"  {r['role']}: {content}")
+    else:
+        print("  (空)")
+
+    conn.close()
+
+
+# 初始化数据库
 init_db()
+
+
+if __name__ == "__main__":
+    # 测试
+    print_all_memories()

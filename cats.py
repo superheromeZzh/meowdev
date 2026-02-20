@@ -1,66 +1,197 @@
 """
 CatAgent 类 —— 每只猫猫的大脑
 
-核心能力：
-- 群聊感知：看到完整对话历史 + 其他猫猫发言
-- 记忆系统：跨会话记住用户偏好
-- 任务看板：通过共享任务列表协调工作
-- 额度降级：Stack喵额度耗尽时，Arch酱 CLI 临时代劳
+核心改进：
+- 群聊感知：每只猫猫都能看到完整的对话历史
+- 记忆系统：猫猫记得用户的偏好和过往对话
+- 自动提取 [记住：xxx] 标记存入记忆
+- 工具调用：猫猫可以使用 Claude Code 的工具（Read, Write, Edit, Bash 等）
 """
 
 import asyncio
+import json
+import os
 import re
 from pathlib import Path
 from typing import AsyncIterator, Optional
 
-from config import CAT_CONFIGS, CLI_TIMEOUT, FALLBACK_CLI, QUOTA_ERROR_KEYWORDS
+from config import CAT_CONFIGS, CLI_TIMEOUT
+
+
+# ── 工具名称中文映射 ──────────────────────────────────────
+
+TOOL_NAMES_CN = {
+    "Read": "读取文件",
+    "Write": "写入文件",
+    "Edit": "编辑文件",
+    "Bash": "执行命令",
+    "Glob": "搜索文件",
+    "Grep": "搜索内容",
+    "WebSearch": "搜索网络",
+    "WebFetch": "获取网页",
+    "Task": "启动子任务",
+}
+
+# ── 工具图标映射 ──────────────────────────────────────
+
+TOOL_ICONS = {
+    "Read": "📖",
+    "Write": "✏️",
+    "Edit": "🔧",
+    "Bash": "💻",
+    "Glob": "🔍",
+    "Grep": "🔎",
+    "WebSearch": "🌐",
+    "WebFetch": "📄",
+    "Task": "🚀",
+}
+
+
+def _get_subprocess_env() -> dict:
+    """获取 subprocess 环境变量，清除 CLAUDECODE 避免嵌套会话检测"""
+    env = os.environ.copy()
+    # 显式设为空字符串，确保子进程不会继承父进程的 CLAUDECODE
+    env["CLAUDECODE"] = ""
+    # 同时清除可能相关的其他变量
+    env.pop("CLAUDE_CODE_SESSION", None)
+    env.pop("ANTHROPIC_API_KEY", None)  # 让子进程用自己的配置
+    # 增加 Node.js 流处理的缓冲区大小
+    env["NODE_OPTIONS"] = "--max-old-space-size=4096"
+    return env
+
+
+def _parse_stream_json_line(line: str) -> Optional[dict]:
+    """解析单行 JSON，失败返回 None"""
+    line = line.strip()
+    if not line:
+        return None
+    try:
+        return json.loads(line)
+    except json.JSONDecodeError:
+        return None
+
+
+def _extract_tool_info(data: dict) -> Optional[tuple[str, str]]:
+    """
+    从 JSON 消息中提取工具信息
+    返回 (工具名称, 工具描述) 或 None
+    """
+    msg_type = data.get("type")
+
+    if msg_type == "assistant":
+        message = data.get("message", {})
+        content = message.get("content", [])
+        if isinstance(content, list):
+            for item in content:
+                if item.get("type") == "tool_use":
+                    tool_name = item.get("name", "未知工具")
+                    tool_input = item.get("input", {})
+                    # 构建简短描述
+                    desc = ""
+                    if tool_name == "Read":
+                        desc = tool_input.get("file_path", "")[:50]
+                    elif tool_name == "Write":
+                        desc = tool_input.get("file_path", "")[:50]
+                    elif tool_name == "Edit":
+                        desc = tool_input.get("file_path", "")[:50]
+                    elif tool_name == "Bash":
+                        desc = tool_input.get("command", "")[:50]
+                    elif tool_name == "Glob":
+                        desc = tool_input.get("pattern", "")
+                    elif tool_name == "Grep":
+                        desc = tool_input.get("pattern", "")
+                    return tool_name, desc
+
+    return None
+
+
+def _extract_tool_details(data: dict) -> Optional[dict]:
+    """
+    从 JSON 消息中提取完整工具信息
+    返回 {"name": "Read", "input": {...}, "id": "xxx"} 或 None
+    """
+    if data.get("type") != "assistant":
+        return None
+
+    message = data.get("message", {})
+    content = message.get("content", [])
+
+    for item in content:
+        if item.get("type") == "tool_use":
+            return {
+                "name": item.get("name"),
+                "input": item.get("input", {}),
+                "id": item.get("id"),
+            }
+    return None
+
+
+def _extract_text_content(data: dict) -> Optional[str]:
+    """从 assistant 消息中提取文本内容"""
+    if data.get("type") != "assistant":
+        return None
+
+    message = data.get("message", {})
+    content = message.get("content", [])
+
+    for item in content:
+        if item.get("type") == "text":
+            return item.get("text", "")
+    return None
+
+
+def _extract_final_result(data: dict) -> Optional[str]:
+    """
+    从 result 类型消息中提取最终文本
+    """
+    if data.get("type") != "result":
+        return None
+
+    result = data.get("result", "")
+    if isinstance(result, str):
+        return result
+
+    # result 可能是内容块列表
+    if isinstance(result, list):
+        texts = []
+        for item in result:
+            if isinstance(item, dict) and item.get("type") == "text":
+                texts.append(item.get("text", ""))
+        return "\n".join(texts)
+
+    return None
+
+
+def _parse_stream_json_output(raw: str) -> str:
+    """
+    解析完整的 stream-json 输出，提取最终结果文本
+    """
+    lines = raw.split("\n")
+    final_text = ""
+
+    for line in lines:
+        data = _parse_stream_json_line(line)
+        if not data:
+            continue
+
+        result = _extract_final_result(data)
+        if result:
+            final_text = result
+
+    return final_text
+
+
 from memory import (
     add_cat_memory,
     format_cat_memory_context,
     format_chat_context,
     format_user_profile_context,
+    set_user_info,
 )
 
 
-def _clean_codex_output(raw: str) -> str:
-    """清洗 codex exec 输出，去除元数据头尾"""
-    lines = raw.split("\n")
-    codex_idx = -1
-    for i, line in enumerate(lines):
-        if line.strip() == "codex":
-            codex_idx = i
-    if codex_idx >= 0:
-        result_lines = []
-        for line in lines[codex_idx + 1:]:
-            if line.strip().startswith("tokens used"):
-                break
-            result_lines.append(line)
-        cleaned = "\n".join(result_lines).strip()
-        if cleaned:
-            return cleaned
-    in_body = False
-    header_passed = 0
-    result_lines = []
-    for line in lines:
-        if line.strip() == "--------":
-            header_passed += 1
-            if header_passed >= 2:
-                in_body = True
-            continue
-        if in_body:
-            if line.strip().startswith("tokens used"):
-                break
-            if line.strip() in ("user", "") or line.strip().startswith("mcp startup"):
-                continue
-            if line.strip().startswith("thinking"):
-                continue
-            result_lines.append(line)
-    cleaned = "\n".join(result_lines).strip()
-    return cleaned if cleaned else raw.strip()
-
-
 def _extract_memories(text: str) -> tuple[str, list[str]]:
-    """从回复中提取 [记住：xxx] 标记"""
+    """从回复中提取 [记住：xxx] 标记，返回（清理后文本, 记忆列表）"""
     memories = re.findall(r'\[记住[：:]\s*(.+?)\]', text)
     clean_text = re.sub(r'\s*\[记住[：:]\s*.+?\]', '', text).strip()
     return clean_text, memories
@@ -78,12 +209,6 @@ class CatAgent:
         self.avatar = cfg["avatar"]
         self.description = cfg["description"]
         self.cli_cmd = cfg["cli_cmd"]
-        self.cli_cmd_full_auto = cfg.get("cli_cmd_full_auto")
-
-        fallback = FALLBACK_CLI.get(cat_id)
-        self.fallback_cli_cmd = fallback["cli_cmd"] if fallback else None
-        self.fallback_helper = fallback["helper_name"] if fallback else None
-        self._using_fallback = False
 
         prompt_file = cfg["prompt_file"]
         if Path(prompt_file).exists():
@@ -91,70 +216,145 @@ class CatAgent:
         else:
             self.personality = f"你是{self.name}，一只{self.breed}。"
 
-    # ── Prompt 构建 ────────────────────────────────────
-
-    def _build_group_prompt(self, session_id: str = "default",
-                            task_board_text: str = "") -> str:
-        """构建群聊 prompt = 性格 + 记忆 + 用户画像 + 对话历史 + 任务看板"""
+    def _build_group_prompt(self, session_id: str = "default") -> str:
+        """构建群聊 prompt = 性格 + 记忆 + 用户画像 + 最近对话"""
         parts = [self.personality]
 
+        # 猫猫记忆
         memory_ctx = format_cat_memory_context(self.cat_id)
         if memory_ctx:
             parts.append(f"\n\n【你的记忆】\n{memory_ctx}")
 
+        # 用户画像
         profile_ctx = format_user_profile_context()
         if profile_ctx:
             parts.append(f"\n\n【{profile_ctx}】")
 
+        # 最近对话历史
         chat_ctx = format_chat_context(session_id)
         if chat_ctx:
             parts.append(f"\n\n【最近的群聊记录】\n{chat_ctx}")
 
-        if task_board_text:
-            parts.append(f"\n\n【任务看板】\n{task_board_text}")
-
         parts.append(
-            "\n\n请基于以上对话上下文回复。不要重复别人说过的内容。\n\n"
-            "你可以在回复中使用任务指令来协调团队工作：\n"
-            "- [新任务：标题] — 拆解出一个待办任务\n"
-            "- [认领：T-xxx] — 认领一个待办任务，然后开始工作\n"
-            "- [完成：T-xxx] — 你完成了某个任务\n"
-            "- [空闲] — 当前没有需要你做的事了\n"
-            "普通聊天直接回复即可，只在有具体工作要推进时使用任务指令。\n\n"
-            "重要：绝对不要让用户手动执行命令或操作。"
-            "遇到问题自己解决，解决不了就叫其他猫猫帮忙。"
+            "\n\n【群聊回应规则】\n"
+            "你在一个活跃的群聊中。\n\n"
+            "- 有想法就直接回复\n"
+            "- 不想参与这个话题 → 回复 [跳过]\n"
+            "- 想听某只猫的看法 → 加 [问:stack] 或 [问:arch] 或 [问:pixel]\n"
+            "- **觉得这个话题值得深入讨论** → 回复末尾加 [讨论]，其他猫猫会继续回应\n"
+            "- 用户透露个人信息（名字、偏好等） → 加 [用户：key: value]\n"
         )
 
         return "\n".join(parts)
 
-    # ── 输出清洗 ───────────────────────────────────────
-
     def _clean_output(self, raw: str) -> str:
-        if self.cat_id == "stack":
-            return _clean_codex_output(raw)
+        """根据猫猫类型清洗输出（支持 stream-json 格式）"""
+        # 检查是否有流处理错误（大文件/大响应）
+        if "chunk is longer than limit" in raw:
+            return f"（{self.name}处理的内容太大了喵，换个文件或者让我分批处理试试？）"
+
+        # 首先尝试解析 stream-json 格式
+        json_result = _parse_stream_json_output(raw)
+        if json_result:
+            return json_result.strip()
+
         return raw.strip()
 
-    def _is_quota_error(self, output: str) -> bool:
-        if not output:
-            return False
-        return any(kw in output.lower() for kw in QUOTA_ERROR_KEYWORDS)
+    def _format_tool_call(self, tool: dict) -> str:
+        """格式化工具调用为友好显示"""
+        name = tool.get("name", "未知工具")
+        icon = TOOL_ICONS.get(name, "⚙️")
+        input_data = tool.get("input", {})
 
-    def process_response(self, response: str) -> tuple[str, bool]:
-        """处理回复：提取记忆、判断是否跳过。返回 (文本, 是否跳过)。"""
+        # 根据工具类型提取关键信息
+        if name == "Read":
+            path = input_data.get("file_path", "?")
+            # 简化路径显示
+            if len(path) > 50:
+                path = "..." + path[-47:]
+            return f"\n*{icon} 读取: {path}*\n"
+        elif name == "Write":
+            path = input_data.get("file_path", "?")
+            if len(path) > 50:
+                path = "..." + path[-47:]
+            return f"\n*{icon} 写入: {path}*\n"
+        elif name == "Edit":
+            path = input_data.get("file_path", "?")
+            if len(path) > 50:
+                path = "..." + path[-47:]
+            return f"\n*{icon} 编辑: {path}*\n"
+        elif name == "Bash":
+            cmd = input_data.get("command", "?")
+            if len(cmd) > 60:
+                cmd = cmd[:57] + "..."
+            return f"\n*{icon} 执行: {cmd}*\n"
+        elif name == "Glob":
+            pattern = input_data.get("pattern", "?")
+            return f"\n*{icon} 搜索文件: {pattern}*\n"
+        elif name == "Grep":
+            pattern = input_data.get("pattern", "?")
+            return f"\n*{icon} 搜索内容: {pattern}*\n"
+        elif name == "WebSearch":
+            query = input_data.get("query", "?")
+            if len(query) > 40:
+                query = query[:37] + "..."
+            return f"\n*{icon} 搜索网络: {query}*\n"
+        elif name == "WebFetch":
+            url = input_data.get("url", "?")
+            if len(url) > 50:
+                url = url[:47] + "..."
+            return f"\n*{icon} 获取网页: {url}*\n"
+        elif name == "Task":
+            desc = input_data.get("description", "?")
+            if len(desc) > 40:
+                desc = desc[:37] + "..."
+            return f"\n*{icon} 子任务: {desc}*\n"
+        else:
+            return f"\n*{icon} {name}*\n"
+
+    def process_response(self, response: str) -> tuple[str, bool, list[str]]:
+        """
+        处理猫猫回复：提取记忆、提取用户信息、判断是否跳过、解析下一轮目标
+        返回：(清理后文本, 是否应跳过, 下一轮目标列表)
+        下一轮目标可能是 ["continue"] 或 ["stack", "arch"] 等
+        """
         if not response:
-            return "", True
+            return "", True, []
+
+        # 检查是否跳过
         if "[跳过]" in response or response.strip() == "跳过":
-            return "", True
-        clean_text, memories = _extract_memories(response)
+            return "", True, []
+
+        # 提取下一轮目标标记
+        next_targets = []
+        for cat_id in ["arch", "stack", "pixel"]:
+            if f"[问:{cat_id}]" in response.lower():
+                next_targets.append(cat_id)
+
+        # 清理标记和提取记忆
+        clean_text = re.sub(r'\[讨论\]|\[问:\w+\]', '', response).strip()
+        clean_text, memories = _extract_memories(clean_text)
         for mem in memories:
             add_cat_memory(self.cat_id, mem.strip(), importance=2)
-        return clean_text, False
 
-    # ── CLI 调用 ───────────────────────────────────────
+        # 提取用户信息
+        user_info = re.findall(r'\[用户[：:]\s*(\w+)[：:]\s*(.+?)\]', clean_text)
+        for key, value in user_info:
+            set_user_info(key.strip(), value.strip())
 
-    async def _call_cli(self, cmd: list, prompt: str,
-                        cwd: Optional[str] = None) -> tuple[str, bool]:
-        """执行 CLI，返回 (输出, 是否出错)。"""
+        # 清理用户信息标记
+        clean_text = re.sub(r'\[用户[：:]\s*\w+[：:]\s*.+?\]', '', clean_text).strip()
+
+        return clean_text, False, next_targets
+
+    # ── 异步调用（主要方式）────────────────────────────
+
+    async def chat_in_group(self, session_id: str = "default",
+                            cwd: Optional[str] = None) -> str:
+        """群聊模式：基于完整上下文生成回复"""
+        prompt = self._build_group_prompt(session_id)
+        cmd = list(self.cli_cmd)
+
         try:
             process = await asyncio.create_subprocess_exec(
                 *cmd,
@@ -162,6 +362,7 @@ class CatAgent:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=cwd,
+                env=_get_subprocess_env(),
             )
             stdout, stderr = await asyncio.wait_for(
                 process.communicate(input=prompt.encode("utf-8")),
@@ -169,123 +370,92 @@ class CatAgent:
             )
             output = self._clean_output(stdout.decode("utf-8"))
             if not output and process.returncode != 0:
-                return stderr.decode("utf-8").strip()[:500], True
-            return output or "", False
+                err = stderr.decode("utf-8").strip()
+                return f"（{self.name}遇到了一点问题喵...）\n{err[:300]}"
+            return output if output else ""
         except asyncio.TimeoutError:
-            return f"（{self.name}想了太久，超时了喵...）", True
+            return f"（{self.name}想了太久，超时了喵...）"
         except FileNotFoundError:
-            return f"（找不到 {cmd[0]} 命令喵...）", True
+            return f"（找不到 {self.cli_cmd[0]} 命令，{self.name}的大脑还没装好喵...）"
         except Exception as e:
-            return f"（{self.name}出了点状况：{e}）", True
-
-    async def _call_with_fallback(self, prompt: str,
-                                  cwd: Optional[str] = None) -> str:
-        """调用主 CLI，额度耗尽时自动降级到备用 CLI。"""
-        output, err = await self._call_cli(self.cli_cmd, prompt, cwd)
-
-        if err and self._is_quota_error(output) and self.fallback_cli_cmd:
-            self._using_fallback = True
-            fb_prompt = (
-                f"你正在临时帮助 {self.name}（{self.role}）。"
-                f"请保持 {self.name} 的说话风格。\n\n" + prompt
-            )
-            output, err = await self._call_cli(self.fallback_cli_cmd, fb_prompt, cwd)
-            if output and not err:
-                output = f"*（{self.fallback_helper}临时帮 {self.name} 回答~）*\n\n{output}"
-            self._using_fallback = False
-
-        return output
-
-    # ── 群聊调用（非流式 / 流式）─────────────────────
-
-    async def chat_in_group(self, session_id: str = "default",
-                            cwd: Optional[str] = None,
-                            task_board_text: str = "") -> str:
-        prompt = self._build_group_prompt(session_id, task_board_text)
-        return await self._call_with_fallback(prompt, cwd)
+            return f"（{self.name}出了点状况喵：{e}）"
 
     async def chat_stream_in_group(self, session_id: str = "default",
-                                    cwd: Optional[str] = None,
-                                    task_board_text: str = "") -> AsyncIterator[str]:
-        prompt = self._build_group_prompt(session_id, task_board_text)
-        cmd = list(self.cli_cmd)
-        collected = ""
-        stream_failed = False
+                                    cwd: Optional[str] = None) -> AsyncIterator[str]:
+        """
+        群聊模式的流式输出版本
+        支持 stream-json 格式，显示工具调用进度和流式文本
+        """
+        prompt = self._build_group_prompt(session_id)
 
         try:
             process = await asyncio.create_subprocess_exec(
-                *cmd,
+                *self.cli_cmd,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=cwd,
+                env=_get_subprocess_env(),
             )
+
+            process.stdout._limit = 10 * 1024 * 1024  # 10MB，支持大文件
             process.stdin.write(prompt.encode("utf-8"))
-            await process.stdin.drain()
             process.stdin.close()
 
-            if self.cat_id == "stack":
-                raw = ""
-                while True:
-                    try:
-                        line = await asyncio.wait_for(
-                            process.stdout.readline(), timeout=CLI_TIMEOUT)
-                    except asyncio.TimeoutError:
-                        break
-                    if not line:
-                        break
-                    raw += line.decode("utf-8")
-                await process.wait()
-                cleaned = self._clean_output(raw)
-                if cleaned:
-                    collected = cleaned
-                    yield cleaned
-                else:
-                    err = (await process.stderr.read()).decode("utf-8")
-                    if self._is_quota_error(raw + err):
-                        stream_failed = True
-            else:
-                while True:
-                    try:
-                        line = await asyncio.wait_for(
-                            process.stdout.readline(), timeout=CLI_TIMEOUT)
-                    except asyncio.TimeoutError:
-                        stream_failed = True
-                        break
-                    if not line:
-                        break
-                    decoded = line.decode("utf-8")
-                    collected += decoded
-                    yield decoded
-                await process.wait()
-                if process.returncode != 0 and not collected.strip():
-                    err = (await process.stderr.read()).decode("utf-8")
-                    if self._is_quota_error(err):
-                        stream_failed = True
+            accumulated_text = ""
+            seen_tool_ids = set()
+            final_result = ""  # 用于存储 result 类型的最终结果
+
+            async for line in process.stdout:
+                line_str = line.decode("utf-8")
+
+                data = _parse_stream_json_line(line_str)
+                if not data:
+                    continue
+
+                # 1. 提取并显示工具调用
+                tool = _extract_tool_details(data)
+                if tool:
+                    tool_id = tool.get("id")
+                    if tool_id and tool_id not in seen_tool_ids:
+                        seen_tool_ids.add(tool_id)
+                        yield self._format_tool_call(tool)
+
+                # 2. 提取文本内容（如果有的话）
+                text = _extract_text_content(data)
+                if text and text != accumulated_text:
+                    # 只 yield 新增的部分
+                    if text.startswith(accumulated_text):
+                        new_text = text[len(accumulated_text):]
+                        accumulated_text = text
+                        if new_text:
+                            yield new_text
+                    else:
+                        # 文本完全不同，直接替换
+                        accumulated_text = text
+                        yield text
+
+                # 3. 提取 result 类型的最终结果（兜底）
+                result_text = _extract_final_result(data)
+                if result_text:
+                    final_result = result_text
+
+            # 4. 如果没有从 assistant 消息获取到文本，使用 result 作为兜底
+            if not accumulated_text and final_result:
+                yield final_result
+            elif not accumulated_text and not final_result:
+                yield "（猫猫处理完了，但没有输出文本喵...）"
 
         except FileNotFoundError:
             yield f"（找不到 {self.cli_cmd[0]} 命令喵...）\n"
-            return
         except Exception as e:
             yield f"（{self.name}出了状况：{e}）\n"
-            return
-
-        if stream_failed and self.fallback_cli_cmd:
-            self._using_fallback = True
-            fb_prompt = (
-                f"你正在临时帮助 {self.name}（{self.role}）。"
-                f"请保持 {self.name} 的说话风格。\n\n" + prompt
-            )
-            output, _ = await self._call_cli(self.fallback_cli_cmd, fb_prompt, cwd)
-            self._using_fallback = False
-            if output:
-                yield f"*（{self.fallback_helper}临时帮 {self.name} 回答~）*\n\n{output}"
 
     def __repr__(self):
         return f"CatAgent({self.name} | {self.breed})"
 
 
-# ── 实例化 ────────────────────────────────────────────
+# ── 实例化三只猫猫 ──────────────────────────────────────
 
 arch = CatAgent("arch")
 stack = CatAgent("stack")
