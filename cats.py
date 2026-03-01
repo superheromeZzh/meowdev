@@ -162,6 +162,41 @@ def _extract_final_result(data: dict) -> Optional[str]:
     return None
 
 
+def extract_model_usage(data: dict) -> dict:
+    """从 result 消息的 modelUsage 字段提取统计（合并所有模型）
+
+    Args:
+        data: stream-json 输出中的 JSON 对象
+
+    Returns:
+        包含 token 和费用信息的字典，如果不是 result 消息则返回空字典
+    """
+    if data.get("type") != "result":
+        return {}
+
+    model_usage = data.get("modelUsage", {})
+    total_input = 0
+    total_output = 0
+    total_cache_read = 0
+    total_cache_creation = 0
+    total_cost = 0
+
+    for model_name, usage in model_usage.items():
+        total_input += usage.get("inputTokens", 0)
+        total_output += usage.get("outputTokens", 0)
+        total_cache_read += usage.get("cacheReadInputTokens", 0)
+        total_cache_creation += usage.get("cacheCreationInputTokens", 0)
+        total_cost += usage.get("costUSD", 0)
+
+    return {
+        "inputTokens": total_input,
+        "outputTokens": total_output,
+        "cacheReadInputTokens": total_cache_read,
+        "cacheCreationInputTokens": total_cache_creation,
+        "costUSD": total_cost,
+    }
+
+
 def _parse_stream_json_output(raw: str) -> str:
     """
     解析完整的 stream-json 输出，提取最终结果文本
@@ -209,6 +244,7 @@ class CatAgent:
         self.avatar = cfg["avatar"]
         self.description = cfg["description"]
         self.cli_cmd = cfg["cli_cmd"]
+        self.last_usage_data: dict = {}  # 存储最后一次请求的使用统计
 
         prompt_file = cfg["prompt_file"]
         if Path(prompt_file).exists():
@@ -439,6 +475,11 @@ class CatAgent:
                 result_text = _extract_final_result(data)
                 if result_text:
                     final_result = result_text
+
+                # 4. 提取 modelUsage 统计数据
+                usage = extract_model_usage(data)
+                if usage:
+                    self.last_usage_data = usage
 
             # 4. 如果没有从 assistant 消息获取到文本，使用 result 作为兜底
             if not accumulated_text and final_result:

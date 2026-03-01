@@ -20,6 +20,7 @@
 
 import sqlite3
 import time
+from datetime import datetime
 from typing import Optional
 
 from config import BASE_DIR
@@ -69,6 +70,22 @@ def init_db():
         )
     """)
 
+    # 猫猫使用统计表
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS cat_usage (
+            id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+            cat_id                  TEXT NOT NULL,
+            input_tokens            INTEGER DEFAULT 0,
+            output_tokens           INTEGER DEFAULT 0,
+            cache_read_tokens       INTEGER DEFAULT 0,
+            cache_creation_tokens   INTEGER DEFAULT 0,
+            cost_usd                REAL DEFAULT 0,
+            hour_slot               TEXT,
+            date_slot               TEXT,
+            timestamp               REAL NOT NULL
+        )
+    """)
+
     # 创建索引
     conn.execute("""
         CREATE INDEX IF NOT EXISTS idx_history_session
@@ -77,6 +94,18 @@ def init_db():
     conn.execute("""
         CREATE INDEX IF NOT EXISTS idx_cat_memories_cat
         ON cat_memories(cat_id, importance DESC)
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_cat_usage_cat
+        ON cat_usage(cat_id, timestamp)
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_cat_usage_hour
+        ON cat_usage(hour_slot)
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_cat_usage_date
+        ON cat_usage(date_slot)
     """)
 
     conn.close()
@@ -264,6 +293,142 @@ def clear_user_profile():
     conn.execute("DELETE FROM user_profile")
     conn.commit()
     conn.close()
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 猫猫使用统计
+# ═══════════════════════════════════════════════════════════════════════
+
+def add_cat_usage(cat_id: str, usage_data: dict):
+    """记录猫猫使用统计
+
+    Args:
+        cat_id: 猫猫ID (arch/stack/pixel)
+        usage_data: 包含 token 和费用信息的字典
+    """
+    now = time.time()
+    dt = datetime.fromtimestamp(now)
+    hour_slot = dt.strftime("%Y-%m-%d-%H")
+    date_slot = dt.strftime("%Y-%m-%d")
+
+    conn = _get_conn()
+    conn.execute("""
+        INSERT INTO cat_usage
+        (cat_id, input_tokens, output_tokens,
+         cache_read_tokens, cache_creation_tokens, cost_usd,
+         hour_slot, date_slot, timestamp)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        cat_id,
+        usage_data.get("inputTokens", 0),
+        usage_data.get("outputTokens", 0),
+        usage_data.get("cacheReadInputTokens", 0),
+        usage_data.get("cacheCreationInputTokens", 0),
+        usage_data.get("costUSD", 0),
+        hour_slot, date_slot, now
+    ))
+    conn.commit()
+    conn.close()
+
+
+def get_cat_stats(cat_id: str, range_type: str = "day") -> dict:
+    """获取单只猫猫的统计
+
+    Args:
+        cat_id: 猫猫ID (arch/stack/pixel)
+        range_type: 时间范围 (day/week/month)
+    """
+    conn = _get_conn()
+
+    # 根据时间范围计算时间戳
+    now = time.time()
+    if range_type == "day":
+        start_ts = now - 24 * 60 * 60
+    elif range_type == "week":
+        start_ts = now - 7 * 24 * 60 * 60
+    else:  # month
+        start_ts = now - 30 * 24 * 60 * 60
+
+    row = conn.execute("""
+        SELECT
+            COALESCE(SUM(input_tokens), 0) as input_tokens,
+            COALESCE(SUM(output_tokens), 0) as output_tokens,
+            COALESCE(SUM(cache_read_tokens), 0) as cache_read_tokens,
+            COALESCE(SUM(cache_creation_tokens), 0) as cache_creation_tokens,
+            COALESCE(SUM(cost_usd), 0) as cost_usd,
+            COUNT(*) as call_count
+        FROM cat_usage WHERE cat_id = ? AND timestamp >= ?
+    """, (cat_id, start_ts)).fetchone()
+    conn.close()
+    return dict(row) if row else {}
+
+
+def get_all_cats_stats(range_type: str = "day") -> dict:
+    """获取所有猫猫的统计
+
+    Args:
+        range_type: 时间范围 (day/week/month)
+    """
+    return {cat_id: get_cat_stats(cat_id, range_type) for cat_id in ["arch", "stack", "pixel"]}
+
+
+def get_trend(range_type: str = "day") -> list:
+    """获取统计趋势
+
+    Args:
+        range_type: 时间范围
+            - day: 返回当天按小时 (最多24个时间点)
+            - week: 返回7天按天
+            - month: 返回30天按天
+
+    Returns:
+        list of dict: 每个时间点的各猫猫统计数据
+    """
+    conn = _get_conn()
+    now = time.time()
+
+    if range_type == "day":
+        # 当天按小时
+        date_str = datetime.now().strftime("%Y-%m-%d")
+        rows = conn.execute("""
+            SELECT hour_slot, cat_id,
+                   SUM(input_tokens) as input_tokens,
+                   SUM(output_tokens) as output_tokens,
+                   SUM(cost_usd) as cost_usd
+            FROM cat_usage
+            WHERE date_slot = ?
+            GROUP BY hour_slot, cat_id
+            ORDER BY hour_slot
+        """, (date_str,)).fetchall()
+    elif range_type == "week":
+        # 7天按天
+        start_ts = now - 7 * 24 * 60 * 60
+        rows = conn.execute("""
+            SELECT date_slot as time_slot, cat_id,
+                   SUM(input_tokens) as input_tokens,
+                   SUM(output_tokens) as output_tokens,
+                   SUM(cost_usd) as cost_usd
+            FROM cat_usage
+            WHERE timestamp >= ?
+            GROUP BY date_slot, cat_id
+            ORDER BY date_slot
+        """, (start_ts,)).fetchall()
+    else:  # month
+        # 30天按天
+        start_ts = now - 30 * 24 * 60 * 60
+        rows = conn.execute("""
+            SELECT date_slot as time_slot, cat_id,
+                   SUM(input_tokens) as input_tokens,
+                   SUM(output_tokens) as output_tokens,
+                   SUM(cost_usd) as cost_usd
+            FROM cat_usage
+            WHERE timestamp >= ?
+            GROUP BY date_slot, cat_id
+            ORDER BY date_slot
+        """, (start_ts,)).fetchall()
+
+    conn.close()
+    return [dict(r) for r in rows]
 
 
 # ═══════════════════════════════════════════════════════════════════════

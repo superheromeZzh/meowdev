@@ -12,6 +12,22 @@ import sys
 from pathlib import Path
 
 import chainlit as cl
+from chainlit.server import app as fastapi_app
+from fastapi.responses import JSONResponse
+
+# ── 内置 API 接口（必须在 chainlit 初始化之前注册）─────────────────────
+from memory import get_all_cats_stats, get_trend
+from starlette.routing import Route
+
+async def api_stats(request):
+    """获取猫猫使用统计 - 内置接口"""
+    range_type = request.query_params.get("range", "day")  # day/week/month
+    stats = get_all_cats_stats(range_type)
+    trend = get_trend(range_type)
+    return JSONResponse({"stats": stats, "trend": trend, "range": range_type})
+
+api_route = Route("/api/stats", endpoint=api_stats, methods=["GET"])
+fastapi_app.routes.insert(0, api_route)
 
 sys.path.insert(0, str(Path(__file__).parent))
 
@@ -22,6 +38,7 @@ from memory import (
     get_messages_paginated,
     get_message_count,
     init_db,
+    add_cat_usage,
 )
 from team import MeowDevTeam, Phase
 from feature_list import FeatureList
@@ -80,6 +97,7 @@ async def on_start():
                 "命令：\n"
                 "- `/team 需求` — 启动团队协作\n"
                 "- `/status` — 查看功能进度\n"
+                "- `/usage` — 查看猫猫使用统计\n"
                 "- `/history [页码]` — 查看历史消息\n"
                 "- `/stop` — 暂停工作"
             ),
@@ -111,6 +129,10 @@ async def on_message(message: cl.Message):
 
     if text == "/status":
         await _show_status()
+        return
+
+    if text == "/usage":
+        await _show_usage()
         return
 
     if text.startswith("/history"):
@@ -164,6 +186,9 @@ async def on_message(message: cl.Message):
 
 async def _cat_respond(cat: CatAgent) -> tuple[str, bool, list[str]] | None:
     """猫猫回复 - 带实时流式输出，返回 (清理后文本, 是否跳过, 下一轮目标列表)"""
+    # 清空上次的使用数据
+    cat.last_usage_data = {}
+
     # 显示"正在思考"状态
     msg = cat_msg(cat, f"_{cat.name} 正在思考..._")
     await msg.send()
@@ -188,6 +213,10 @@ async def _cat_respond(cat: CatAgent) -> tuple[str, bool, list[str]] | None:
         msg.content = f"（{cat.name}出了点状况: {e}）"
         await msg.update()
         return None
+
+    # 记录使用统计
+    if cat.last_usage_data:
+        add_cat_usage(cat.cat_id, cat.last_usage_data)
 
     clean, skip, targets = cat.process_response(full)
 
@@ -275,6 +304,13 @@ async def _show_status():
     await cl.Message(content=content).send()
 
 
+async def _show_usage():
+    """显示猫猫使用统计 - 提示用户打开右侧面板"""
+    await cl.Message(
+        content="📊 点击右下角的 **统计按钮** 打开用量面板，支持按天/周/月查看详细统计。"
+    ).send()
+
+
 async def _run_team(requirement: str):
     """运行团队协作"""
     from config import OUTPUT_DIR
@@ -343,3 +379,5 @@ async def _run_team(requirement: str):
 @cl.author_rename
 def rename_author(orig: str) -> str:
     return {"arch": "Arch酱", "stack": "Stack喵", "pixel": "Pixel咪"}.get(orig, orig)
+
+
