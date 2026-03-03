@@ -23,32 +23,32 @@ table td {
 }
 
 /* 暗色主题表格 */
-[data-theme="dark"] table,
-[data-theme="dark"] table th,
-[data-theme="dark"] table td {
+.dark table,
+.dark table th,
+.dark table td {
   border-color: rgba(255, 255, 255, 0.12) !important;
   color: rgba(255, 255, 255, 0.87) !important;
 }
 
-[data-theme="dark"] table th {
+.dark table th {
   background: rgba(255, 255, 255, 0.08) !important;
   color: rgba(255, 255, 255, 0.87) !important;
 }
 
-[data-theme="dark"] table tr:nth-child(even) {
+.dark table tr:nth-child(even) {
   background: rgba(255, 255, 255, 0.03) !important;
 }
 
 /* 暗色主题代码块 */
-[data-theme="dark"] pre {
+.dark pre {
   border-color: rgba(255, 255, 255, 0.1) !important;
 }
 
 /* 暗色主题下所有文字确保可见 */
-[data-theme="dark"] .MuiTypography-root,
-[data-theme="dark"] p,
-[data-theme="dark"] li,
-[data-theme="dark"] span {
+.dark .MuiTypography-root,
+.dark p,
+.dark li,
+.dark span {
   color: inherit !important;
 }
 
@@ -650,137 +650,139 @@ body.drawer-open #root {
   color: #1e293b;
 }
 
-/* 暗色主题适配 */
-[data-theme="dark"] .usage-card.arch {
-  background: rgba(30, 58, 138, 0.1);
-  border-color: rgba(30, 64, 175, 0.5);
+/* 暗色主题适配 - 匹配 Chainlit 灰度主题 */
+/* Chainlit dark: bg=#212121, card=#2e2e2e, text=#ededed, muted=#b5b5b5, border=#424242 */
+
+.dark .usage-card.arch {
+  background: rgba(46, 46, 46, 0.5);
+  border-color: rgba(66, 66, 66, 0.8);
 }
 
-[data-theme="dark"] .usage-card.arch .usage-card-info h3,
-[data-theme="dark"] .usage-card.arch .usage-stat-value {
-  color: #e2e8f0;
+.dark .usage-card.arch .usage-card-info h3,
+.dark .usage-card.arch .usage-stat-value {
+  color: #ededed;
 }
 
-[data-theme="dark"] .usage-card.arch .usage-card-theme {
+.dark .usage-card.arch .usage-card-theme {
   color: #60a5fa;
-  background: rgba(30, 58, 138, 0.3);
+  background: rgba(59, 130, 246, 0.2);
 }
 
-[data-theme="dark"] .usage-card.arch .usage-stat-item {
-  background: rgba(30, 41, 59, 0.6);
+.dark .usage-card.arch .usage-stat-item {
+  background: rgba(66, 66, 66, 0.5);
 }
 
-[data-theme="dark"] .usage-card.stack {
-  background: rgba(67, 20, 7, 0.1);
-  border-color: rgba(154, 52, 18, 0.5);
+.dark .usage-card.stack {
+  background: rgba(46, 46, 46, 0.5);
+  border-color: rgba(66, 66, 66, 0.8);
 }
 
-[data-theme="dark"] .usage-card.stack .usage-card-info h3,
-[data-theme="dark"] .usage-card.stack .usage-stat-value {
-  color: #e2e8f0;
+.dark .usage-card.stack .usage-card-info h3,
+.dark .usage-card.stack .usage-stat-value {
+  color: #ededed;
 }
 
-[data-theme="dark"] .usage-card.stack .usage-card-theme {
+.dark .usage-card.stack .usage-card-theme {
   color: #fb923c;
-  background: rgba(67, 20, 7, 0.3);
+  background: rgba(251, 146, 60, 0.2);
 }
 
-[data-theme="dark"] .usage-card.stack .usage-stat-item {
-  background: rgba(30, 41, 59, 0.6);
+.dark .usage-card.stack .usage-stat-item {
+  background: rgba(66, 66, 66, 0.5);
 }
 
-[data-theme="dark"] .usage-card.pixel {
-  background: rgba(72, 4, 40, 0.1);
-  border-color: rgba(131, 24, 67, 0.5);
+.dark .usage-card.pixel {
+  background: rgba(46, 46, 46, 0.5);
+  border-color: rgba(66, 66, 66, 0.8);
 }
 
-[data-theme="dark"] .usage-card.pixel .usage-card-info h3,
-[data-theme="dark"] .usage-card.pixel .usage-stat-value {
-  color: #e2e8f0;
+.dark .usage-card.pixel .usage-card-info h3,
+.dark .usage-card.pixel .usage-stat-value {
+  color: #ededed;
 }
 
-[data-theme="dark"] .usage-card.pixel .usage-card-theme {
+.dark .usage-card.pixel .usage-card-theme {
   color: #f472b6;
-  background: rgba(72, 4, 40, 0.3);
+  background: rgba(244, 114, 182, 0.2);
 }
 
-[data-theme="dark"] .usage-card.pixel .usage-stat-item {
-  background: rgba(30, 41, 59, 0.6);
+.dark .usage-card.pixel .usage-stat-item {
+  background: rgba(66, 66, 66, 0.5);
 }
 
-[data-theme="dark"] .usage-stat-label {
-  color: #94a3b8;
+.dark .usage-stat-label {
+  color: #b5b5b5;
 }
 
-/* 暗色主题 - Tailwind 风格适配 */
-[data-theme="dark"] #meowdev-drawer {
-  background: #0f172a;
-  border-left-color: #1e293b;
+/* 抽屉暗色主题 */
+.dark #meowdev-drawer {
+  background: #212121;
+  border-left-color: #424242;
 }
 
-[data-theme="dark"] .drawer-header {
-  border-bottom-color: #1e293b;
-  background: rgba(15, 23, 42, 0.8);
+.dark .drawer-header {
+  border-bottom-color: #424242;
+  background: rgba(33, 33, 33, 0.9);
 }
 
-[data-theme="dark"] .drawer-header h3 {
-  color: #f1f5f9;
+.dark .drawer-header h3 {
+  color: #ededed;
 }
 
-[data-theme="dark"] .drawer-header-btn {
-  color: #94a3b8;
+.dark .drawer-header-btn {
+  color: #b5b5b5;
 }
 
-[data-theme="dark"] .drawer-header-btn:hover {
-  background: #1e293b;
+.dark .drawer-header-btn:hover {
+  background: #2e2e2e;
 }
 
-[data-theme="dark"] .time-range-selector {
-  background: rgba(15, 23, 42, 0.8);
-  border-bottom-color: #1e293b;
+.dark .time-range-selector {
+  background: rgba(33, 33, 33, 0.9);
+  border-bottom-color: #424242;
 }
 
-[data-theme="dark"] .time-range-buttons {
-  background: #1e293b;
+.dark .time-range-buttons {
+  background: #2e2e2e;
 }
 
-[data-theme="dark"] .time-range-btn {
-  color: #64748b;
+.dark .time-range-btn {
+  color: #737373;
 }
 
-[data-theme="dark"] .time-range-btn:hover {
-  color: #e2e8f0;
+.dark .time-range-btn:hover {
+  color: #ededed;
 }
 
-[data-theme="dark"] .time-range-btn.active {
-  background: #334155;
-  color: #60a5fa;
+.dark .time-range-btn.active {
+  background: #424242;
+  color: #ededed;
 }
 
-[data-theme="dark"] #drawer-toggle {
-  background: #1e293b;
-  color: #60a5fa;
-  border-color: #334155;
+.dark #drawer-toggle {
+  background: #2e2e2e;
+  color: #ededed;
+  border-color: #424242;
 }
 
-[data-theme="dark"] #drawer-toggle:hover {
-  background: #334155;
+.dark #drawer-toggle:hover {
+  background: #424242;
 }
 
-[data-theme="dark"] .trend-section {
-  background: rgba(30, 41, 59, 0.3);
-  border-color: #1e293b;
+.dark .trend-section {
+  background: rgba(46, 46, 46, 0.5);
+  border-color: #424242;
 }
 
-[data-theme="dark"] .trend-section h4 {
-  color: #94a3b8;
+.dark .trend-section h4 {
+  color: #b5b5b5;
 }
 
-[data-theme="dark"] .trend-bar-item {
-  background: linear-gradient(180deg, #3b82f6 0%, #2563eb 100%);
+.dark .trend-bar-item {
+  background: linear-gradient(180deg, #b5b5b5 0%, #737373 100%);
 }
 
-[data-theme="dark"] .empty-state {
-  color: #64748b;
+.dark .empty-state {
+  color: #737373;
 }
 
