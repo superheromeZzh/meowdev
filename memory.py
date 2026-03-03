@@ -20,6 +20,7 @@
 
 import sqlite3
 import time
+import uuid
 from datetime import datetime
 from typing import Optional
 
@@ -86,6 +87,18 @@ def init_db():
         )
     """)
 
+    # 会话表
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS sessions (
+            id            TEXT PRIMARY KEY,
+            name          TEXT NOT NULL,
+            created_at    REAL NOT NULL,
+            updated_at    REAL NOT NULL,
+            message_count INTEGER DEFAULT 0,
+            is_archived   INTEGER DEFAULT 0
+        )
+    """)
+
     # 创建索引
     conn.execute("""
         CREATE INDEX IF NOT EXISTS idx_history_session
@@ -107,7 +120,152 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_cat_usage_date
         ON cat_usage(date_slot)
     """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_sessions_updated
+        ON sessions(updated_at DESC)
+    """)
 
+    # 迁移旧的 "meowdev" 数据到新系统
+    _migrate_legacy_session(conn)
+
+    # 清理幽灵 session：没有用户消息的 session（由 on_chat_start 误创建的）
+    phantom_ids = [r["id"] for r in conn.execute("""
+        SELECT s.id FROM sessions s
+        WHERE s.message_count <= 1
+        AND s.id NOT IN (
+            SELECT DISTINCT session_id FROM chat_history
+            WHERE role IN ('用户', 'user')
+        )
+    """).fetchall()]
+    if phantom_ids:
+        ph = ",".join("?" * len(phantom_ids))
+        conn.execute(f"DELETE FROM chat_history WHERE session_id IN ({ph})", phantom_ids)
+        conn.execute(f"DELETE FROM sessions WHERE id IN ({ph})", phantom_ids)
+        conn.commit()
+        print(f"[MeowDev] 清理了 {len(phantom_ids)} 个空会话")
+
+    conn.close()
+
+
+def _migrate_legacy_session(conn):
+    """迁移旧的 "meowdev" 数据到新系统"""
+    # 检查是否存在旧的 meowdev 数据
+    row = conn.execute(
+        "SELECT COUNT(*) as count FROM chat_history WHERE session_id = 'meowdev'"
+    ).fetchone()
+
+    if row and row["count"] > 0:
+        # 检查是否已有对应的 session 记录
+        existing = conn.execute(
+            "SELECT id FROM sessions WHERE id = 'meowdev'"
+        ).fetchone()
+
+        if not existing:
+            # 获取最早消息的时间作为创建时间
+            first_msg = conn.execute(
+                "SELECT MIN(timestamp) as ts FROM chat_history WHERE session_id = 'meowdev'"
+            ).fetchone()
+            created_at = first_msg["ts"] if first_msg and first_msg["ts"] else time.time()
+
+            # 获取最新消息的时间作为更新时间
+            last_msg = conn.execute(
+                "SELECT MAX(timestamp) as ts FROM chat_history WHERE session_id = 'meowdev'"
+            ).fetchone()
+            updated_at = last_msg["ts"] if last_msg and last_msg["ts"] else time.time()
+
+            # 创建 session 记录
+            conn.execute("""
+                INSERT INTO sessions (id, name, created_at, updated_at, message_count)
+                VALUES (?, ?, ?, ?, ?)
+            """, ("meowdev", "历史对话", created_at, updated_at, row["count"]))
+            conn.commit()  # 必须提交事务！
+            print(f"[MeowDev] 已迁移 {row['count']} 条历史消息到会话 'meowdev'")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 会话管理
+# ═══════════════════════════════════════════════════════════════════════
+
+def create_session(name: str = "新对话", session_id: str = None) -> str:
+    """创建新会话，返回 session_id
+
+    Args:
+        name: 会话名称
+        session_id: 可选的会话ID，如果不提供则自动生成
+    """
+    if not session_id:
+        session_id = str(uuid.uuid4())[:8]  # 使用短 UUID
+    now = time.time()
+    conn = _get_conn()
+    conn.execute(
+        "INSERT INTO sessions (id, name, created_at, updated_at, message_count) VALUES (?, ?, ?, ?, 0)",
+        (session_id, name, now, now),
+    )
+    conn.commit()
+    conn.close()
+    return session_id
+
+
+def get_session(session_id: str) -> Optional[dict]:
+    """获取会话元数据"""
+    conn = _get_conn()
+    row = conn.execute(
+        "SELECT id, name, created_at, updated_at, message_count, is_archived FROM sessions WHERE id = ?",
+        (session_id,),
+    ).fetchone()
+    conn.close()
+    if row:
+        return {
+            "id": row["id"],
+            "name": row["name"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+            "message_count": row["message_count"],
+            "is_archived": row["is_archived"],
+        }
+    return None
+
+
+def update_session(session_id: str, name: str = None):
+    """更新会话名称"""
+    conn = _get_conn()
+    if name:
+        conn.execute(
+            "UPDATE sessions SET name = ?, updated_at = ? WHERE id = ?",
+            (name, time.time(), session_id),
+        )
+        conn.commit()
+    conn.close()
+
+
+def list_sessions(limit: int = 50) -> list[dict]:
+    """获取会话列表，按更新时间倒序"""
+    conn = _get_conn()
+    rows = conn.execute(
+        "SELECT id, name, created_at, updated_at, message_count, is_archived "
+        "FROM sessions WHERE is_archived = 0 ORDER BY updated_at DESC LIMIT ?",
+        (limit,),
+    ).fetchall()
+    conn.close()
+    return [
+        {
+            "id": r["id"],
+            "name": r["name"],
+            "created_at": r["created_at"],
+            "updated_at": r["updated_at"],
+            "message_count": r["message_count"],
+            "is_archived": r["is_archived"],
+        }
+        for r in rows
+    ]
+
+
+def delete_session(session_id: str):
+    """删除会话及其消息"""
+    conn = _get_conn()
+    conn.execute("DELETE FROM chat_history WHERE session_id = ?", (session_id,))
+    conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+    conn.commit()
     conn.close()
 
 
@@ -117,9 +275,15 @@ def init_db():
 
 def add_message(role: str, content: str, session_id: str = "default"):
     conn = _get_conn()
+    now = time.time()
     conn.execute(
         "INSERT INTO chat_history (role, content, timestamp, session_id) VALUES (?, ?, ?, ?)",
-        (role, content, time.time(), session_id),
+        (role, content, now, session_id),
+    )
+    # 更新会话的 updated_at 和 message_count
+    conn.execute(
+        "UPDATE sessions SET updated_at = ?, message_count = message_count + 1 WHERE id = ?",
+        (now, session_id),
     )
     conn.commit()
     conn.close()

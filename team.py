@@ -107,7 +107,7 @@ class MeowDevTeam:
             if on_cat_speak:
                 return await on_cat_speak(cat, phase, task)
             response = await cat.chat_in_group(session_id, cwd=work_dir)
-            clean_text, _ = cat.process_response(response)
+            clean_text, _, _ = cat.process_response(response)
             return clean_text or response
 
         async def sys_msg(phase: Phase, content: str):
@@ -304,7 +304,7 @@ if __name__ == "__main__":
             print(f"🐱 {cat.name}（{cat.role}）")
             print(f"---")
             response = await cat.chat_in_group("cli-test")
-            clean_text, _ = cat.process_response(response)
+            clean_text, _, _ = cat.process_response(response)
             result = clean_text or response
             print(result)
             return result

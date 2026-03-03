@@ -1,186 +1,286 @@
-// MeowDev 自定义脚本 - 立即执行
-// 修复头像尺寸为 56px
+// MeowDev 自定义脚本
+// 模块: 品牌页隐藏 + 头像修复 / 会话恢复 / 统计抽屉
 
+// ── 品牌页隐藏（初始加载 + SPA 导航）+ 头像修复 ────────────────────
 (function() {
-  function injectStyle() {
-    if (document.getElementById('meowdev-avatar-fix')) return;
+  var style = document.createElement('style');
+  style.id = 'meowdev-critical';
+  style.textContent =
+    'span.rounded-full.h-5.w-5,' +
+    'span[class*="h-5"][class*="w-5"][class*="rounded-full"]{' +
+    'width:56px!important;height:56px!important;min-width:56px!important;min-height:56px!important}' +
+    'img[src*="/avatars/"]{width:56px!important;height:56px!important}' +
+    '#root.meowdev-hide{opacity:0!important}' +
+    '#root.meowdev-ready{opacity:1!important;transition:opacity .15s ease}';
+  (document.head || document.documentElement).appendChild(style);
 
-    const style = document.createElement('style');
-    style.id = 'meowdev-avatar-fix';
-    style.textContent = `
-      /* 头像尺寸修复 - Chainlit 2.x */
-      span.rounded-full.h-5.w-5,
-      span[class*="h-5"][class*="w-5"][class*="rounded-full"] {
-        width: 56px !important;
-        height: 56px !important;
-        min-width: 56px !important;
-        min-height: 56px !important;
-      }
-      img[src*="/avatars/"] {
-        width: 56px !important;
-        height: 56px !important;
-      }
-    `;
+  var currentThread = null;
+  var timer = null, obs = null, timeout = null;
 
-    (document.head || document.documentElement).appendChild(style);
-    console.log('[MeowDev] Avatar style injected');
+  function getThreadId() {
+    var m = window.location.pathname.match(/\/thread\/([^/?]+)/);
+    return m ? m[1] : null;
   }
 
-  // 立即尝试注入
-  injectStyle();
-
-  // DOM 就绪后再次注入
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', injectStyle);
+  function cleanup() {
+    if (timer) { clearInterval(timer); timer = null; }
+    if (obs) { obs.disconnect(); obs = null; }
+    if (timeout) { clearTimeout(timeout); timeout = null; }
   }
 
-  // 延迟注入（处理 SPA）
-  setTimeout(injectStyle, 100);
-  setTimeout(injectStyle, 500);
-  setTimeout(injectStyle, 1000);
+  function hide() {
+    var root = document.getElementById('root');
+    if (root) {
+      root.classList.remove('meowdev-ready');
+      root.classList.add('meowdev-hide');
+    }
+  }
 
-  // 监听 DOM 变化
-  const observer = new MutationObserver(injectStyle);
-  observer.observe(document.documentElement, { childList: true, subtree: true });
+  function reveal() {
+    var root = document.getElementById('root');
+    if (root) {
+      root.classList.remove('meowdev-hide');
+      root.classList.add('meowdev-ready');
+    }
+    cleanup();
+  }
+
+  function hasContent() {
+    var root = document.getElementById('root');
+    if (!root) return false;
+    return root.querySelectorAll(
+      '[class*="step"], [class*="Step"], [class*="message"], [class*="Message"]'
+    ).length > 0;
+  }
+
+  function pollForContent() {
+    if (hasContent()) { reveal(); return; }
+    timer = setInterval(function() {
+      if (hasContent()) reveal();
+    }, 50);
+    var root = document.getElementById('root');
+    if (root) {
+      obs = new MutationObserver(function() {
+        if (hasContent()) reveal();
+      });
+      obs.observe(root, { childList: true, subtree: true });
+    }
+    timeout = setTimeout(reveal, 5000);
+  }
+
+  // 初始加载：如果在 thread 页面，立即隐藏等消息
+  if (getThreadId()) {
+    currentThread = getThreadId();
+    hide();
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', pollForContent);
+    } else {
+      pollForContent();
+    }
+  }
+
+  // SPA 导航：监听 URL 变化
+  var lastPath = window.location.pathname;
+
+  function onRouteChange() {
+    var threadId = getThreadId();
+    if (threadId && threadId !== currentThread) {
+      cleanup();
+      currentThread = threadId;
+      hide();
+      // 等 React 卸载旧内容（300ms），再开始检测新内容
+      setTimeout(pollForContent, 300);
+    } else if (!threadId) {
+      currentThread = null;
+      reveal();
+    }
+  }
+
+  function checkRoute() {
+    if (window.location.pathname !== lastPath) {
+      lastPath = window.location.pathname;
+      onRouteChange();
+    }
+  }
+
+  var origPush = history.pushState;
+  history.pushState = function() {
+    origPush.apply(this, arguments);
+    setTimeout(checkRoute, 0);
+  };
+  var origReplace = history.replaceState;
+  history.replaceState = function() {
+    origReplace.apply(this, arguments);
+    setTimeout(checkRoute, 0);
+  };
+  window.addEventListener('popstate', function() { setTimeout(checkRoute, 0); });
+  setInterval(checkRoute, 300);
 })();
 
 
-// ── 猫猫统计抽屉 (一比一还原 token_use.html) ─────────────────────────────────────
-
+// ── 会话恢复模块 ─────────────────────────────────────────────────
 (function() {
-  const CATS = {
+  var STORAGE_KEY = 'meowdev_last_thread_id';
+
+  function tryRestore() {
+    if (window.location.pathname !== '/') return false;
+
+    var isReload = false;
+    try {
+      var navEntries = performance.getEntriesByType('navigation');
+      if (navEntries.length > 0 && navEntries[0].type === 'reload') isReload = true;
+    } catch(e) {}
+    if (!isReload && performance.navigation && performance.navigation.type === 1) isReload = true;
+    if (!isReload && sessionStorage.getItem('meowdev_was_loaded')) isReload = true;
+
+    if (!isReload) {
+      sessionStorage.setItem('meowdev_was_loaded', '1');
+      return false;
+    }
+
+    var lastThread = localStorage.getItem(STORAGE_KEY);
+    if (!lastThread) return false;
+
+    history.replaceState({}, '', '/thread/' + lastThread);
+    return true;
+  }
+
+  tryRestore();
+  sessionStorage.setItem('meowdev_was_loaded', '1');
+
+  function saveCurrentThread() {
+    var m = window.location.pathname.match(/\/thread\/([^/?]+)/);
+    if (m) localStorage.setItem(STORAGE_KEY, m[1]);
+  }
+
+  var lastPath = window.location.pathname;
+  setInterval(function() {
+    if (window.location.pathname !== lastPath) {
+      lastPath = window.location.pathname;
+      saveCurrentThread();
+    }
+  }, 500);
+  saveCurrentThread();
+})();
+
+
+// ── 猫猫统计抽屉 ─────────────────────────────────────────────────────────────
+(function() {
+  var CATS = {
     arch:  { name: 'Arch酱',  badge: 'Soft Blue Theme' },
     stack: { name: 'Stack喵', badge: 'Warm Orange Theme' },
     pixel: { name: 'Pixel咪', badge: 'Soft Pink Theme' },
   };
-  const CAT_ORDER = ['arch', 'stack', 'pixel'];
+  var CAT_ORDER = ['arch', 'stack', 'pixel'];
 
   function getActiveRange() {
-    const active = document.querySelector('.time-range-btn.active');
+    var active = document.querySelector('.time-range-btn.active');
     return active ? active.dataset.range : 'week';
   }
 
-  function createDrawer() {
-    if (document.getElementById('meowdev-drawer')) return;
-
-    // 创建主布局容器
-    const layoutContainer = document.createElement('div');
-    layoutContainer.id = 'meowdev-layout';
-    document.body.appendChild(layoutContainer);
-
-    // 创建内容包装器（用于包裹 Chainlit 的主内容）
-    const contentWrapper = document.createElement('div');
-    contentWrapper.id = 'meowdev-content-wrapper';
-
-    // 将 #root 移动到 contentWrapper 中
-    const root = document.getElementById('root');
-    if (root) {
-      layoutContainer.appendChild(contentWrapper);
-      contentWrapper.appendChild(root);
-    }
-
-    // 创建抽屉
-    const drawer = document.createElement('div');
-    drawer.id = 'meowdev-drawer';
-    drawer.innerHTML = `
-      <header class="drawer-header">
-        <div class="drawer-header-left">
-          <span class="material-symbols-outlined">dashboard</span>
-          <h3>用量统计</h3>
-        </div>
-        <div class="drawer-header-actions">
-          <button class="drawer-header-btn refresh" id="refresh-stats" title="刷新">
-            <span class="material-symbols-outlined">refresh</span>
-          </button>
-          <button class="drawer-header-btn close" id="close-drawer" title="关闭">
-            <span class="material-symbols-outlined">close</span>
-          </button>
-        </div>
-      </header>
-      <div class="time-range-selector">
-        <div class="time-range-buttons">
-          <button class="time-range-btn" data-range="day">当天</button>
-          <button class="time-range-btn active" data-range="week">一周</button>
-          <button class="time-range-btn" data-range="month">一个月</button>
-        </div>
-      </div>
-      <div class="drawer-content">
-        <div id="cat-stats"><div class="empty-state">加载中...</div></div>
-      </div>
-    `;
-    layoutContainer.appendChild(drawer);
-
-    document.getElementById('close-drawer').onclick = () => {
-      document.getElementById('meowdev-drawer').classList.remove('open');
-      document.body.classList.remove('drawer-open');
-    };
-    document.getElementById('refresh-stats').onclick = fetchStats;
-
-    drawer.querySelectorAll('.time-range-btn').forEach(btn => {
-      btn.onclick = (e) => {
-        drawer.querySelectorAll('.time-range-btn').forEach(b => b.classList.remove('active'));
-        e.target.classList.add('active');
-        fetchStats();
-      };
-    });
-
-    const btn = document.createElement('button');
-    btn.id = 'drawer-toggle';
-    btn.innerHTML = '<span class="material-symbols-outlined">monitoring</span>';
-    btn.title = '用量统计';
-    btn.onclick = toggleDrawer;
-    document.body.appendChild(btn);
-  }
-
   window.toggleDrawer = function() {
-    const drawer = document.getElementById('meowdev-drawer');
+    var drawer = document.getElementById('meowdev-drawer');
     if (drawer) {
-      const wasClosed = !drawer.classList.contains('open');
+      var wasClosed = !drawer.classList.contains('open');
       drawer.classList.toggle('open');
       document.body.classList.toggle('drawer-open', wasClosed);
       if (wasClosed) fetchStats();
     }
   };
 
-  async function fetchStats() {
-    const container = document.getElementById('cat-stats');
+  function createDrawer() {
+    if (document.getElementById('meowdev-drawer')) return;
+
+    var drawer = document.createElement('div');
+    drawer.id = 'meowdev-drawer';
+    drawer.innerHTML =
+      '<header class="drawer-header">' +
+        '<div class="drawer-header-left">' +
+          '<span class="material-symbols-outlined">dashboard</span>' +
+          '<h3>用量统计</h3>' +
+        '</div>' +
+        '<div class="drawer-header-actions">' +
+          '<button class="drawer-header-btn refresh" id="refresh-stats" title="刷新">' +
+            '<span class="material-symbols-outlined">refresh</span>' +
+          '</button>' +
+          '<button class="drawer-header-btn close" id="close-drawer" title="关闭">' +
+            '<span class="material-symbols-outlined">close</span>' +
+          '</button>' +
+        '</div>' +
+      '</header>' +
+      '<div class="time-range-selector">' +
+        '<div class="time-range-buttons">' +
+          '<button class="time-range-btn" data-range="day">当天</button>' +
+          '<button class="time-range-btn active" data-range="week">一周</button>' +
+          '<button class="time-range-btn" data-range="month">一个月</button>' +
+        '</div>' +
+      '</div>' +
+      '<div class="drawer-content">' +
+        '<div id="cat-stats"><div class="empty-state">加载中...</div></div>' +
+      '</div>';
+    document.body.appendChild(drawer);
+
+    document.getElementById('close-drawer').onclick = function() {
+      document.getElementById('meowdev-drawer').classList.remove('open');
+      document.body.classList.remove('drawer-open');
+    };
+    document.getElementById('refresh-stats').onclick = fetchStats;
+
+    drawer.querySelectorAll('.time-range-btn').forEach(function(btn) {
+      btn.onclick = function(e) {
+        drawer.querySelectorAll('.time-range-btn').forEach(function(b) { b.classList.remove('active'); });
+        e.target.classList.add('active');
+        fetchStats();
+      };
+    });
+
+    var btn = document.createElement('button');
+    btn.id = 'drawer-toggle';
+    btn.innerHTML = '<span class="material-symbols-outlined">monitoring</span>';
+    btn.title = '用量统计';
+    btn.onclick = window.toggleDrawer;
+    document.body.appendChild(btn);
+  }
+
+  function fetchStats() {
+    var container = document.getElementById('cat-stats');
     if (container) container.innerHTML = '<div class="empty-state">加载中...</div>';
 
-    const range = getActiveRange();
+    var range = getActiveRange();
 
-    try {
-      const res = await fetch('/api/stats?range=' + range);
-      if (!res.ok) throw new Error('HTTP ' + res.status);
-      const data = await res.json();
-      renderCatStats(data.stats || {});
-    } catch (e) {
-      console.error('[MeowDev] Failed to fetch stats:', e.message);
-      if (container) {
-        container.innerHTML = '<div class="empty-state">加载失败<br><small>' + e.message + '</small></div>';
-      }
-    }
+    fetch('/api/stats?range=' + range)
+      .then(function(res) {
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        return res.json();
+      })
+      .then(function(data) { renderCatStats(data.stats || {}); })
+      .catch(function(e) {
+        if (container) {
+          container.innerHTML = '<div class="empty-state">加载失败<br><small>' + e.message + '</small></div>';
+        }
+      });
   }
 
   function fmt(n) { return (n || 0).toLocaleString(); }
 
   function renderCatStats(stats) {
-    const container = document.getElementById('cat-stats');
+    var container = document.getElementById('cat-stats');
     if (!container) return;
 
-    const hasData = CAT_ORDER.some(id => stats[id] && stats[id].call_count > 0);
+    var hasData = CAT_ORDER.some(function(id) { return stats[id] && stats[id].call_count > 0; });
     if (!hasData) {
       container.innerHTML = '<div class="empty-state">暂无使用数据</div>';
       return;
     }
 
     container.innerHTML = '<div class="usage-container"></div>';
-    const wrap = container.querySelector('.usage-container');
+    var wrap = container.querySelector('.usage-container');
 
-    CAT_ORDER.forEach(catId => {
-      const d = stats[catId];
+    CAT_ORDER.forEach(function(catId) {
+      var d = stats[catId];
       if (!d) return;
-      const cfg = CATS[catId];
-      const card = document.createElement('div');
+      var cfg = CATS[catId];
+      var card = document.createElement('div');
       card.className = 'usage-card ' + catId;
       card.innerHTML =
         '<div class="usage-card-header">' +
@@ -203,10 +303,7 @@
     });
   }
 
-  function init() {
-    createDrawer();
-  }
-
+  function init() { createDrawer(); }
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', init);
   } else {
