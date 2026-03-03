@@ -6,16 +6,34 @@ CatAgent 类 —— 每只猫猫的大脑
 - 记忆系统：猫猫记得用户的偏好和过往对话
 - 自动提取 [记住：xxx] 标记存入记忆
 - 工具调用：猫猫可以使用 Claude Code 的工具（Read, Write, Edit, Bash 等）
+
+Phase 1 升级：
+- 持久化交互式会话：每只猫猫维护独立的持久进程
+- 实时流式输出：支持 stdin/stdout 双向通信
+- Session 管理：通过 --session-id 绑定会话上下文
 """
 
 import asyncio
 import json
 import os
 import re
+import uuid
 from pathlib import Path
 from typing import AsyncIterator, Optional
 
 from config import CAT_CONFIGS, CLI_TIMEOUT
+
+
+# ── 交互式 CLI 配置 ──────────────────────────────────────
+
+CLAUDE_CLI_PATH = os.getenv("CLAUDE_CLI_PATH", "claude")
+
+# 交互式模式的基础 flags
+INTERACTIVE_FLAGS = [
+    "--output-format", "stream-json",
+    "--verbose",
+    "--dangerously-skip-permissions",
+]
 
 
 # ── 工具名称中文映射 ──────────────────────────────────────
@@ -233,7 +251,13 @@ def _extract_memories(text: str) -> tuple[str, list[str]]:
 
 
 class CatAgent:
-    """一只猫猫 Agent，封装 CLI 调用 + 记忆 + 群聊上下文"""
+    """一只猫猫 Agent，封装 CLI 调用 + 记忆 + 群聊上下文
+
+    Phase 1 升级：支持持久化交互式会话
+    - 每只猫猫维护独立的持久进程（stdin/stdout PIPE）
+    - 通过 session_id 绑定会话上下文
+    - 支持实时流式输出
+    """
 
     def __init__(self, cat_id: str):
         cfg = CAT_CONFIGS[cat_id]
@@ -245,6 +269,12 @@ class CatAgent:
         self.description = cfg["description"]
         self.cli_cmd = cfg["cli_cmd"]
         self.last_usage_data: dict = {}  # 存储最后一次请求的使用统计
+
+        # Phase 1: 持久化进程管理
+        self.process: Optional[asyncio.subprocess.Process] = None
+        self.session_id: str = f"meow-{cat_id}-{uuid.uuid4().hex[:8]}"
+        self._is_interactive: bool = False  # 是否使用交互式模式
+        self._lock = asyncio.Lock()  # 进程操作锁，防止并发问题
 
         prompt_file = cfg["prompt_file"]
         if Path(prompt_file).exists():
@@ -295,6 +325,122 @@ class CatAgent:
             return json_result.strip()
 
         return raw.strip()
+
+    # ── Phase 1: 持久化交互式会话 ────────────────────────────
+
+    async def _start_cli_process(self, cwd: Optional[str] = None) -> asyncio.subprocess.Process:
+        """
+        启动持久化 CLI 进程（如果尚未启动）
+        返回进程对象
+        """
+        async with self._lock:
+            if self.process and self.process.returncode is None:
+                return self.process
+
+            # 构建命令：使用 session-id 保持会话连续性
+            cmd = [CLAUDE_CLI_PATH, "-p", *INTERACTIVE_FLAGS]
+
+            self.process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=cwd,
+                env=_get_subprocess_env(),
+            )
+            # 增大缓冲区支持大文件
+            if self.process.stdout:
+                self.process.stdout._limit = 10 * 1024 * 1024  # 10MB
+
+            self._is_interactive = True
+            return self.process
+
+    async def send_message(self, message: str, cwd: Optional[str] = None) -> AsyncIterator[str]:
+        """
+        交互式发送消息并实时流式读取响应
+
+        Args:
+            message: 用户消息/提示词
+            cwd: 工作目录
+
+        Yields:
+            流式输出的文本片段
+        """
+        process = await self._start_cli_process(cwd)
+
+        # 发送消息到 stdin（一次性模式：写入后关闭 stdin）
+        # 注意：Claude Code CLI 的 -p 模式是单次交互，需要每次发送完整 prompt
+        process.stdin.write(message.encode("utf-8"))
+        process.stdin.close()
+
+        accumulated_text = ""
+        seen_tool_ids = set()
+        final_result = ""
+
+        async for line in process.stdout:
+            line_str = line.decode("utf-8")
+
+            data = _parse_stream_json_line(line_str)
+            if not data:
+                continue
+
+            # 1. 提取并显示工具调用
+            tool = _extract_tool_details(data)
+            if tool:
+                tool_id = tool.get("id")
+                if tool_id and tool_id not in seen_tool_ids:
+                    seen_tool_ids.add(tool_id)
+                    yield self._format_tool_call(tool)
+
+            # 2. 提取文本内容（增量）
+            text = _extract_text_content(data)
+            if text and text != accumulated_text:
+                if text.startswith(accumulated_text):
+                    new_text = text[len(accumulated_text):]
+                    accumulated_text = text
+                    if new_text:
+                        yield new_text
+                else:
+                    accumulated_text = text
+                    yield text
+
+            # 3. 提取 result 类型的最终结果（兜底）
+            result_text = _extract_final_result(data)
+            if result_text:
+                final_result = result_text
+
+            # 4. 提取 modelUsage 统计数据
+            usage = extract_model_usage(data)
+            if usage:
+                self.last_usage_data = usage
+
+        # 如果没有从 assistant 消息获取到文本，使用 result 作为兜底
+        if not accumulated_text and final_result:
+            yield final_result
+        elif not accumulated_text and not final_result:
+            yield "（猫猫处理完了，但没有输出文本喵...）"
+
+        # 进程结束，重置状态
+        self._is_interactive = False
+        self.process = None
+
+    async def cleanup(self):
+        """
+        清理资源：终止进程、归档会话
+        在会话结束或 handover 时调用
+        """
+        async with self._lock:
+            if self.process and self.process.returncode is None:
+                try:
+                    self.process.terminate()
+                    await asyncio.wait_for(self.process.wait(), timeout=5.0)
+                except asyncio.TimeoutError:
+                    self.process.kill()
+                    await self.process.wait()
+                except Exception:
+                    pass
+            self.process = None
+            self._is_interactive = False
 
     def _format_tool_call(self, tool: dict) -> str:
         """格式化工具调用为友好显示"""
@@ -386,9 +532,34 @@ class CatAgent:
     # ── 异步调用（主要方式）────────────────────────────
 
     async def chat_in_group(self, session_id: str = "default",
-                            cwd: Optional[str] = None) -> str:
-        """群聊模式：基于完整上下文生成回复"""
+                            cwd: Optional[str] = None,
+                            use_interactive: bool = True) -> str:
+        """
+        群聊模式：基于完整上下文生成回复
+
+        Phase 1 升级：
+        - use_interactive=True: 使用新的交互式模式
+        - use_interactive=False: 使用原有的单次调用模式
+        """
         prompt = self._build_group_prompt(session_id)
+
+        # 更新 session_id 用于会话管理
+        if session_id != "default":
+            self.session_id = f"meow-{self.cat_id}-{session_id[:16]}"
+
+        if use_interactive:
+            # Phase 1: 使用新的交互式模式
+            full = ""
+            try:
+                async for chunk in self.send_message(prompt, cwd):
+                    full += chunk
+                return full
+            except FileNotFoundError:
+                return f"（找不到 {CLAUDE_CLI_PATH} 命令，{self.name}的大脑还没装好喵...）"
+            except Exception as e:
+                return f"（{self.name}出了点状况喵：{e}）"
+
+        # 原有的单次调用模式（fallback）
         cmd = list(self.cli_cmd)
 
         try:
@@ -417,13 +588,37 @@ class CatAgent:
             return f"（{self.name}出了点状况喵：{e}）"
 
     async def chat_stream_in_group(self, session_id: str = "default",
-                                    cwd: Optional[str] = None) -> AsyncIterator[str]:
+                                    cwd: Optional[str] = None,
+                                    use_interactive: bool = True) -> AsyncIterator[str]:
         """
         群聊模式的流式输出版本
         支持 stream-json 格式，显示工具调用进度和流式文本
+
+        Phase 1 升级：
+        - use_interactive=True: 使用新的交互式模式（支持 --resume 会话恢复）
+        - use_interactive=False: 使用原有的单次调用模式
         """
         prompt = self._build_group_prompt(session_id)
 
+        # 更新 session_id 用于会话管理
+        if session_id != "default":
+            # 为每个 Chainlit session 创建独立的 CLI session
+            self.session_id = f"meow-{self.cat_id}-{session_id[:16]}"
+
+        if use_interactive:
+            # Phase 1: 使用新的交互式模式
+            try:
+                async for chunk in self.send_message(prompt, cwd):
+                    yield chunk
+                return
+            except FileNotFoundError:
+                yield f"（找不到 {CLAUDE_CLI_PATH} 命令喵...）\n"
+                return
+            except Exception as e:
+                yield f"（{self.name}出了状况：{e}）\n"
+                return
+
+        # 原有的单次调用模式（fallback）
         try:
             process = await asyncio.create_subprocess_exec(
                 *self.cli_cmd,
