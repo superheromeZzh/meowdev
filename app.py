@@ -8,6 +8,7 @@ MeowDev 群聊界面 —— Chainlit 主入口（简化版）
 使用 Chainlit 原生的 Data Layer 实现会话管理。
 """
 
+import asyncio
 import random
 import sys
 from pathlib import Path
@@ -31,6 +32,9 @@ from memory import (
     add_cat_usage,
     create_session,
     get_session,
+    update_cat_last_spoke,
+    get_recent_messages,
+    update_session_summary,
 )
 from team import MeowDevTeam, Phase
 from feature_list import FeatureList
@@ -200,6 +204,11 @@ async def on_message(message: cl.Message):
 
         responders = next_round
 
+    # 摘要更新触发：每 20 条消息检查一次
+    message_count = get_message_count(session_id)
+    if message_count > 0 and message_count % 20 == 0:
+        asyncio.create_task(_update_summary_background(session_id))
+
 
 async def _cat_respond(cat: CatAgent, session_id: str) -> tuple[str, bool, list[str]] | None:
     """猫猫回复 - 带实时流式输出，返回 (清理后文本, 是否跳过, 下一轮目标列表)"""
@@ -234,6 +243,9 @@ async def _cat_respond(cat: CatAgent, session_id: str) -> tuple[str, bool, list[
     # 记录使用统计
     if cat.last_usage_data:
         add_cat_usage(cat.cat_id, cat.last_usage_data)
+
+    # 更新发言时间戳（增量历史优化）
+    update_cat_last_spoke(cat.cat_id, session_id)
 
     clean, skip, targets = cat.process_response(full)
 
@@ -396,5 +408,87 @@ async def _run_team(requirement: str, session_id: str = "meowdev"):
 @cl.author_rename
 def rename_author(orig: str) -> str:
     return {"arch": "Arch酱", "stack": "Stack喵", "pixel": "Pixel咪"}.get(orig, orig)
+
+
+# ── 摘要更新后台任务 ─────────────────────────────────────────────────────────────
+
+SUMMARY_PROMPT = """请分析以下对话历史，生成一份简洁的结构化摘要。
+
+对话历史：
+{chat_history}
+
+请以 JSON 格式输出，包含以下字段：
+{{
+    "summary": "对话的整体摘要（2-3句话概括主要内容和进展）",
+    "key_goals": ["用户想要达成的目标1", "目标2"],
+    "key_decisions": ["做出的重要决策1", "决策2"]
+}}
+
+注意：
+- summary 应该简洁但信息丰富
+- key_goals 关注用户意图和项目目标
+- key_decisions 关注技术选型、方案确定等重要决定
+- 如果没有明确的目标或决策，对应数组可以为空
+"""
+
+
+async def _update_summary_background(session_id: str):
+    """
+    后台更新会话摘要
+
+    使用 Arch 酱来生成摘要（因为她擅长总结）
+    """
+    import json
+
+    try:
+        # 获取消息历史
+        messages = get_recent_messages(session_id, limit=50)
+        if not messages:
+            return
+
+        # 格式化对话历史
+        chat_text = "\n".join(
+            f"{m['role']}：{m['content']}"
+            for m in messages
+        )
+
+        prompt = SUMMARY_PROMPT.format(chat_history=chat_text)
+
+        # 使用 Arch 酱来生成摘要（直接发送 prompt，不使用群聊上下文）
+        summary_text = ""
+        async for chunk in arch.send_message(prompt, session_id):
+            summary_text += chunk
+
+        if not summary_text.strip():
+            return
+
+        summary_text = summary_text.strip()
+
+        # 尝试解析 JSON
+        try:
+            # 处理可能的 markdown 代码块
+            if summary_text.startswith("```"):
+                lines = summary_text.split("\n")
+                if lines[0].startswith("```"):
+                    lines = lines[1:]
+                if lines and lines[-1].startswith("```"):
+                    lines = lines[:-1]
+                summary_text = "\n".join(lines)
+
+            parsed = json.loads(summary_text)
+            update_session_summary(
+                session_id,
+                parsed.get("summary", summary_text),
+                parsed.get("key_goals", []),
+                parsed.get("key_decisions", []),
+            )
+            print(f"[MeowDev] 已更新会话 {session_id[:8]} 的摘要")
+        except json.JSONDecodeError:
+            # JSON 解析失败，直接使用文本作为摘要
+            update_session_summary(session_id, summary_text[:500], [], [])
+            print(f"[MeowDev] 已更新会话 {session_id[:8]} 的摘要（文本模式）")
+
+    except Exception as e:
+        print(f"[MeowDev] 更新摘要时出错: {e}")
 
 

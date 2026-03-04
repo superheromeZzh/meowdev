@@ -242,8 +242,10 @@ from memory import (
     add_cat_memory,
     format_cat_memory_context,
     format_chat_context,
+    format_chat_context_since,
     format_user_profile_context,
     set_user_info,
+    get_cat_last_spoke,
 )
 
 
@@ -295,7 +297,7 @@ class CatAgent:
             self.personality = f"你是{self.name}，一只{self.breed}。"
 
     def _build_group_prompt(self, session_id: str = "default") -> str:
-        """构建群聊 prompt = 性格 + 记忆 + 用户画像 + 最近对话"""
+        """构建群聊 prompt = 性格 + 记忆 + 用户画像 + 增量对话历史"""
         parts = [self.personality]
 
         # 猫猫记忆
@@ -308,10 +310,17 @@ class CatAgent:
         if profile_ctx:
             parts.append(f"\n\n【{profile_ctx}】")
 
-        # 最近对话历史
-        chat_ctx = format_chat_context(session_id)
-        if chat_ctx:
-            parts.append(f"\n\n【最近的群聊记录】\n{chat_ctx}")
+        # 增量对话历史（关键改动）
+        chat_ctx, is_cold_start = format_chat_context_since(self.cat_id, self.name, session_id)
+
+        if is_cold_start:
+            # 冷启动：使用摘要
+            if chat_ctx:
+                parts.append(f"\n\n【对话背景（摘要）】\n{chat_ctx}")
+        else:
+            # 增量历史
+            if chat_ctx:
+                parts.append(f"\n\n【你缺席期间的对话】\n{chat_ctx}")
 
         parts.append(
             "\n\n【群聊回应规则】\n"

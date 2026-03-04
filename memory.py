@@ -99,6 +99,27 @@ def init_db():
         )
     """)
 
+    # 猫猫发言时间戳表（增量读取用）
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS cat_last_spoke (
+            cat_id      TEXT NOT NULL,
+            session_id  TEXT NOT NULL,
+            last_spoke_at  REAL NOT NULL,
+            PRIMARY KEY (cat_id, session_id)
+        )
+    """)
+
+    # 会话摘要表（冷启动用）
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS session_summaries (
+            session_id  TEXT PRIMARY KEY,
+            summary     TEXT NOT NULL,
+            key_goals   TEXT,
+            key_decisions TEXT,
+            updated_at  REAL NOT NULL
+        )
+    """)
+
     # 创建索引
     conn.execute("""
         CREATE INDEX IF NOT EXISTS idx_history_session
@@ -593,6 +614,174 @@ def get_trend(range_type: str = "day") -> list:
 
     conn.close()
     return [dict(r) for r in rows]
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 猫猫发言时间戳（增量读取）
+# ═══════════════════════════════════════════════════════════════════════
+
+def update_cat_last_spoke(cat_id: str, session_id: str):
+    """更新猫猫发言时间戳"""
+    conn = _get_conn()
+    conn.execute("""
+        INSERT OR REPLACE INTO cat_last_spoke (cat_id, session_id, last_spoke_at)
+        VALUES (?, ?, ?)
+    """, (cat_id, session_id, time.time()))
+    conn.commit()
+    conn.close()
+
+
+def get_cat_last_spoke(cat_id: str, session_id: str) -> Optional[float]:
+    """获取猫猫上次发言时间戳，没有记录返回 None"""
+    conn = _get_conn()
+    row = conn.execute(
+        "SELECT last_spoke_at FROM cat_last_spoke WHERE cat_id = ? AND session_id = ?",
+        (cat_id, session_id),
+    ).fetchone()
+    conn.close()
+    return row["last_spoke_at"] if row else None
+
+
+def clear_cat_last_spoke(session_id: str = None, cat_id: str = None):
+    """清空发言时间戳记录
+
+    Args:
+        session_id: 清空指定会话的记录，None 表示所有会话
+        cat_id: 清空指定猫猫的记录，None 表示所有猫猫
+    """
+    conn = _get_conn()
+    if session_id and cat_id:
+        conn.execute("DELETE FROM cat_last_spoke WHERE session_id = ? AND cat_id = ?", (session_id, cat_id))
+    elif session_id:
+        conn.execute("DELETE FROM cat_last_spoke WHERE session_id = ?", (session_id,))
+    elif cat_id:
+        conn.execute("DELETE FROM cat_last_spoke WHERE cat_id = ?", (cat_id,))
+    else:
+        conn.execute("DELETE FROM cat_last_spoke")
+    conn.commit()
+    conn.close()
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 会话摘要（冷启动用）
+# ═══════════════════════════════════════════════════════════════════════
+
+def get_session_summary(session_id: str) -> Optional[dict]:
+    """获取会话摘要"""
+    import json as _json
+    conn = _get_conn()
+    row = conn.execute(
+        "SELECT summary, key_goals, key_decisions, updated_at FROM session_summaries WHERE session_id = ?",
+        (session_id,),
+    ).fetchone()
+    conn.close()
+    if not row:
+        return None
+    return {
+        "summary": row["summary"],
+        "key_goals": _json.loads(row["key_goals"]) if row["key_goals"] else [],
+        "key_decisions": _json.loads(row["key_decisions"]) if row["key_decisions"] else [],
+        "updated_at": row["updated_at"],
+    }
+
+
+def update_session_summary(session_id: str, summary: str, goals: list[str] = None, decisions: list[str] = None):
+    """更新会话摘要"""
+    import json as _json
+    conn = _get_conn()
+    conn.execute("""
+        INSERT OR REPLACE INTO session_summaries (session_id, summary, key_goals, key_decisions, updated_at)
+        VALUES (?, ?, ?, ?, ?)
+    """, (
+        session_id,
+        summary,
+        _json.dumps(goals or [], ensure_ascii=False),
+        _json.dumps(decisions or [], ensure_ascii=False),
+        time.time(),
+    ))
+    conn.commit()
+    conn.close()
+
+
+def delete_session_summary(session_id: str):
+    """删除会话摘要"""
+    conn = _get_conn()
+    conn.execute("DELETE FROM session_summaries WHERE session_id = ?", (session_id,))
+    conn.commit()
+    conn.close()
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 增量对话历史
+# ═══════════════════════════════════════════════════════════════════════
+
+def get_messages_since(timestamp: float, session_id: str, exclude_role: str = None) -> list[dict]:
+    """获取指定时间后的消息，可选排除特定角色"""
+    conn = _get_conn()
+    if exclude_role:
+        rows = conn.execute(
+            "SELECT role, content, timestamp FROM chat_history "
+            "WHERE session_id = ? AND timestamp > ? AND role != ? "
+            "ORDER BY timestamp ASC",
+            (session_id, timestamp, exclude_role),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT role, content, timestamp FROM chat_history "
+            "WHERE session_id = ? AND timestamp > ? "
+            "ORDER BY timestamp ASC",
+            (session_id, timestamp),
+        ).fetchall()
+    conn.close()
+    return [{"role": r["role"], "content": r["content"], "timestamp": r["timestamp"]} for r in rows]
+
+
+def format_chat_context_since(cat_id: str, cat_name: str, session_id: str = "default") -> tuple[str, bool]:
+    """
+    格式化增量对话历史
+
+    Args:
+        cat_id: 猫猫ID (arch/stack/pixel)
+        cat_name: 猫猫名称，用于过滤自己的发言
+        session_id: 会话ID
+
+    Returns:
+        (格式化的上下文字符串, 是否是冷启动)
+        - 冷启动时返回摘要上下文
+        - 增量时返回新消息
+    """
+    last_spoke = get_cat_last_spoke(cat_id, session_id)
+
+    if last_spoke is None:
+        # 冷启动：返回摘要
+        summary = get_session_summary(session_id)
+        if summary:
+            return _format_summary_context(summary), True
+        return "", True  # 无历史
+
+    # 增量读取，排除自己的发言
+    messages = get_messages_since(last_spoke, session_id, exclude_role=cat_name)
+    if not messages:
+        return "", False
+
+    return "\n".join(f"{m['role']}：{m['content']}" for m in messages), False
+
+
+def _format_summary_context(summary: dict) -> str:
+    """格式化摘要上下文"""
+    lines = [summary["summary"]]
+
+    if summary.get("key_goals"):
+        lines.append("\n关键目标：")
+        for goal in summary["key_goals"]:
+            lines.append(f"  • {goal}")
+
+    if summary.get("key_decisions"):
+        lines.append("\n重要决策：")
+        for decision in summary["key_decisions"]:
+            lines.append(f"  • {decision}")
+
+    return "\n".join(lines)
 
 
 # ═══════════════════════════════════════════════════════════════════════
