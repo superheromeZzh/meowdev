@@ -29,9 +29,13 @@ from config import CAT_CONFIGS, CLI_TIMEOUT
 CLAUDE_CLI_PATH = os.getenv("CLAUDE_CLI_PATH", "claude")
 
 # 交互式模式的基础 flags
+# Phase 1 修复：必须保留 -p（headless 模式入口），stream-json 功能才能生效
 INTERACTIVE_FLAGS = [
+    "-p",  # 必须保留！这是 headless 模式入口，stream-json 功能只在此模式下生效
     "--output-format", "stream-json",
-    "--verbose",
+    "--input-format", "stream-json",
+    "--verbose",  # 必需！stream-json 输出格式需要此标志
+    # "--include-partial-messages",  # 暂时注释，先验证基本流程
     "--dangerously-skip-permissions",
 ]
 
@@ -272,7 +276,8 @@ class CatAgent:
 
         # Phase 1: 持久化进程管理
         self.process: Optional[asyncio.subprocess.Process] = None
-        self.session_id: str = f"meow-{cat_id}-{uuid.uuid4().hex[:8]}"
+        # session_id 必须是有效的 UUID 格式
+        self.session_id: str = str(uuid.uuid4())
         self._is_interactive: bool = False  # 是否使用交互式模式
         self._lock = asyncio.Lock()  # 进程操作锁，防止并发问题
 
@@ -332,13 +337,26 @@ class CatAgent:
         """
         启动持久化 CLI 进程（如果尚未启动）
         返回进程对象
+
+        Phase 1 修复 v2 完成：
+        - 必须保留 -p 标志（headless 模式入口）
+        - Step 4: 加回 --session-id 实现记忆持久化
         """
         async with self._lock:
             if self.process and self.process.returncode is None:
+                print(f"[DEBUG] 复用进程 PID={self.process.pid}, cat_id={self.cat_id}")
                 return self.process
 
-            # 构建命令：使用 session-id 保持会话连续性
-            cmd = [CLAUDE_CLI_PATH, "-p", *INTERACTIVE_FLAGS]
+            # Step 4: 加回 --session-id 实现会话记忆
+            cmd = [
+                CLAUDE_CLI_PATH,
+                "-p",
+                "--session-id", self.session_id,  # 关键：绑定会话，实现记忆持久化
+                "--output-format", "stream-json",
+                "--input-format", "stream-json",
+                "--verbose",
+                "--dangerously-skip-permissions",
+            ]
 
             self.process = await asyncio.create_subprocess_exec(
                 *cmd,
@@ -353,11 +371,33 @@ class CatAgent:
                 self.process.stdout._limit = 10 * 1024 * 1024  # 10MB
 
             self._is_interactive = True
+
+            # DEBUG 打印
+            print(f"[DEBUG] 启动进程 PID={self.process.pid}, cat_id={self.cat_id}, session_id={self.session_id}")
+
+            # 启动后台 stderr 监听
+            asyncio.create_task(self._read_stderr())
+
             return self.process
+
+    async def _read_stderr(self):
+        """后台读取 stderr，打印错误信息（调试用）"""
+        if self.process and self.process.stderr:
+            try:
+                async for line in self.process.stderr:
+                    print(f"[STDERR:{self.cat_id}] {line.decode('utf-8').strip()}")
+            except Exception as e:
+                print(f"[STDERR:{self.cat_id}] 读取错误: {e}")
 
     async def send_message(self, message: str, cwd: Optional[str] = None) -> AsyncIterator[str]:
         """
         交互式发送消息并实时流式读取响应
+
+        Phase 1 修复 v2：
+        - 使用 stream-json 输入格式发送消息
+        - 不关闭 stdin，使用 drain() 保持管道常开
+        - 不重置 self.process，保持进程常驻
+        - Step 2: 添加 DEBUG 打印
 
         Args:
             message: 用户消息/提示词
@@ -368,15 +408,23 @@ class CatAgent:
         """
         process = await self._start_cli_process(cwd)
 
-        # 发送消息到 stdin（一次性模式：写入后关闭 stdin）
-        # 注意：Claude Code CLI 的 -p 模式是单次交互，需要每次发送完整 prompt
-        process.stdin.write(message.encode("utf-8"))
-        process.stdin.close()
+        # Step 2: DEBUG 打印
+        print(f"[DEBUG] send_message: PID={process.pid}, alive={process.returncode is None}")
+
+        # 发送 JSON 格式消息（不关闭 stdin！）
+        # Phase 1 修复 v3：正确格式是 {"type": "user", "message": {"role": "user", "content": "xxx"}}
+        input_json = json.dumps({
+            "type": "user",
+            "message": {"role": "user", "content": message}
+        }) + "\n"
+        process.stdin.write(input_json.encode("utf-8"))
+        await process.stdin.drain()  # 刷新缓冲区，但不关闭
 
         accumulated_text = ""
         seen_tool_ids = set()
         final_result = ""
 
+        # 读取响应直到收到 result 类型消息
         async for line in process.stdout:
             line_str = line.decode("utf-8")
 
@@ -414,15 +462,18 @@ class CatAgent:
             if usage:
                 self.last_usage_data = usage
 
+            # 5. 检测响应结束（result 类型）
+            if data.get("type") == "result":
+                break  # 退出循环，但不关闭进程
+
         # 如果没有从 assistant 消息获取到文本，使用 result 作为兜底
         if not accumulated_text and final_result:
             yield final_result
         elif not accumulated_text and not final_result:
             yield "（猫猫处理完了，但没有输出文本喵...）"
 
-        # 进程结束，重置状态
-        self._is_interactive = False
-        self.process = None
+        # 不要重置 self.process = None！
+        # 不要关闭 stdin！进程保持常驻等待下一条消息
 
     async def cleanup(self):
         """
@@ -543,9 +594,11 @@ class CatAgent:
         """
         prompt = self._build_group_prompt(session_id)
 
-        # 更新 session_id 用于会话管理
+        # 更新 session_id 用于会话管理（必须是有效 UUID）
+        # 基于 Chainlit session_id 生成确定性 UUID
         if session_id != "default":
-            self.session_id = f"meow-{self.cat_id}-{session_id[:16]}"
+            # 使用 UUID5 基于 session_id 生成确定性 UUID
+            self.session_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"meow-{self.cat_id}-{session_id}"))
 
         if use_interactive:
             # Phase 1: 使用新的交互式模式
@@ -600,10 +653,11 @@ class CatAgent:
         """
         prompt = self._build_group_prompt(session_id)
 
-        # 更新 session_id 用于会话管理
+        # 更新 session_id 用于会话管理（必须是有效 UUID）
+        # 基于 Chainlit session_id 生成确定性 UUID
         if session_id != "default":
-            # 为每个 Chainlit session 创建独立的 CLI session
-            self.session_id = f"meow-{self.cat_id}-{session_id[:16]}"
+            # 使用 UUID5 基于 session_id 生成确定性 UUID
+            self.session_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"meow-{self.cat_id}-{session_id}"))
 
         if use_interactive:
             # Phase 1: 使用新的交互式模式
