@@ -261,6 +261,12 @@ class CatAgent:
     - 每只猫猫维护独立的持久进程（stdin/stdout PIPE）
     - 通过 session_id 绑定会话上下文
     - 支持实时流式输出
+
+    Phase 2 升级：多租户会话隔离
+    - 每个 Chainlit thread 维护独立的 CLI 进程
+    - session_id -> process 的字典映射
+    - 同一 thread 内复用进程（保持记忆）
+    - 不同 thread 使用不同进程
     """
 
     def __init__(self, cat_id: str):
@@ -274,12 +280,13 @@ class CatAgent:
         self.cli_cmd = cfg["cli_cmd"]
         self.last_usage_data: dict = {}  # 存储最后一次请求的使用统计
 
-        # Phase 1: 持久化进程管理
-        self.process: Optional[asyncio.subprocess.Process] = None
-        # session_id 必须是有效的 UUID 格式
-        self.session_id: str = str(uuid.uuid4())
-        self._is_interactive: bool = False  # 是否使用交互式模式
-        self._lock = asyncio.Lock()  # 进程操作锁，防止并发问题
+        # Phase 2: 多租户进程管理
+        # 每个 session_id 对应独立的进程
+        self._processes: dict[str, asyncio.subprocess.Process] = {}
+        # 每个 session_id 对应独立的锁，防止同一 session 内并发问题
+        self._locks: dict[str, asyncio.Lock] = {}
+        # 全局锁，保护 _locks 字典的并发访问
+        self._global_lock = asyncio.Lock()
 
         prompt_file = cfg["prompt_file"]
         if Path(prompt_file).exists():
@@ -331,34 +338,58 @@ class CatAgent:
 
         return raw.strip()
 
-    # ── Phase 1: 持久化交互式会话 ────────────────────────────
+    # ── Phase 2: 多租户会话隔离 ────────────────────────────
 
-    async def _start_cli_process(self, cwd: Optional[str] = None) -> asyncio.subprocess.Process:
+    async def _get_session_lock(self, session_id: str) -> asyncio.Lock:
+        """获取或创建 per-session 锁"""
+        async with self._global_lock:
+            if session_id not in self._locks:
+                self._locks[session_id] = asyncio.Lock()
+            return self._locks[session_id]
+
+    def _get_cli_session_id(self, session_id: str) -> str:
+        """基于 Chainlit session_id 生成确定性 CLI session UUID"""
+        return str(uuid.uuid5(uuid.NAMESPACE_URL, f"meow-{self.cat_id}-{session_id}"))
+
+    async def _start_cli_process(self, session_id: str, cwd: Optional[str] = None) -> asyncio.subprocess.Process:
         """
-        启动持久化 CLI 进程（如果尚未启动）
-        返回进程对象
+        启动或复用持久化 CLI 进程
 
-        Phase 1 修复 v2 完成：
-        - 必须保留 -p 标志（headless 模式入口）
-        - Step 4: 加回 --session-id 实现记忆持久化
+        Phase 2 多租户隔离：
+        - 每个 session_id 对应独立的进程
+        - 同一 session_id 复用进程（保持记忆）
+        - 不同 session_id 使用不同进程
+
+        Args:
+            session_id: Chainlit thread ID
+            cwd: 工作目录
+
+        Returns:
+            该 session 对应的进程对象
         """
-        async with self._lock:
-            if self.process and self.process.returncode is None:
-                print(f"[DEBUG] 复用进程 PID={self.process.pid}, cat_id={self.cat_id}")
-                return self.process
+        lock = await self._get_session_lock(session_id)
 
-            # Step 4: 加回 --session-id 实现会话记忆
+        async with lock:
+            # 检查该 session 是否已有进程
+            process = self._processes.get(session_id)
+            if process and process.returncode is None:
+                print(f"[DEBUG] 复用进程 PID={process.pid}, cat_id={self.cat_id}, session_id={session_id}")
+                return process
+
+            # 生成确定性 CLI session UUID
+            cli_session_id = self._get_cli_session_id(session_id)
+
             cmd = [
                 CLAUDE_CLI_PATH,
                 "-p",
-                "--session-id", self.session_id,  # 关键：绑定会话，实现记忆持久化
+                "--session-id", cli_session_id,  # 关键：绑定会话，实现记忆持久化
                 "--output-format", "stream-json",
                 "--input-format", "stream-json",
                 "--verbose",
                 "--dangerously-skip-permissions",
             ]
 
-            self.process = await asyncio.create_subprocess_exec(
+            process = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
@@ -367,46 +398,46 @@ class CatAgent:
                 env=_get_subprocess_env(),
             )
             # 增大缓冲区支持大文件
-            if self.process.stdout:
-                self.process.stdout._limit = 10 * 1024 * 1024  # 10MB
+            if process.stdout:
+                process.stdout._limit = 10 * 1024 * 1024  # 10MB
 
-            self._is_interactive = True
+            # 存储到字典
+            self._processes[session_id] = process
 
             # DEBUG 打印
-            print(f"[DEBUG] 启动进程 PID={self.process.pid}, cat_id={self.cat_id}, session_id={self.session_id}")
+            print(f"[DEBUG] 启动新进程 PID={process.pid}, cat_id={self.cat_id}, session_id={session_id}, cli_session_id={cli_session_id}")
 
             # 启动后台 stderr 监听
-            asyncio.create_task(self._read_stderr())
+            asyncio.create_task(self._read_stderr(process, session_id))
 
-            return self.process
+            return process
 
-    async def _read_stderr(self):
+    async def _read_stderr(self, process: asyncio.subprocess.Process, session_id: str):
         """后台读取 stderr，打印错误信息（调试用）"""
-        if self.process and self.process.stderr:
+        if process and process.stderr:
             try:
-                async for line in self.process.stderr:
-                    print(f"[STDERR:{self.cat_id}] {line.decode('utf-8').strip()}")
+                async for line in process.stderr:
+                    print(f"[STDERR:{self.cat_id}:{session_id[:8]}] {line.decode('utf-8').strip()}")
             except Exception as e:
-                print(f"[STDERR:{self.cat_id}] 读取错误: {e}")
+                print(f"[STDERR:{self.cat_id}:{session_id[:8]}] 读取错误: {e}")
 
-    async def send_message(self, message: str, cwd: Optional[str] = None) -> AsyncIterator[str]:
+    async def send_message(self, message: str, session_id: str = "default", cwd: Optional[str] = None) -> AsyncIterator[str]:
         """
         交互式发送消息并实时流式读取响应
 
-        Phase 1 修复 v2：
-        - 使用 stream-json 输入格式发送消息
-        - 不关闭 stdin，使用 drain() 保持管道常开
-        - 不重置 self.process，保持进程常驻
-        - Step 2: 添加 DEBUG 打印
+        Phase 2 多租户隔离：
+        - session_id 参数用于区分不同 Chainlit thread
+        - 每个 session 使用独立的 CLI 进程
 
         Args:
             message: 用户消息/提示词
+            session_id: Chainlit thread ID，用于进程隔离
             cwd: 工作目录
 
         Yields:
             流式输出的文本片段
         """
-        process = await self._start_cli_process(cwd)
+        process = await self._start_cli_process(session_id, cwd)
 
         # Step 2: DEBUG 打印
         print(f"[DEBUG] send_message: PID={process.pid}, alive={process.returncode is None}")
@@ -475,23 +506,43 @@ class CatAgent:
         # 不要重置 self.process = None！
         # 不要关闭 stdin！进程保持常驻等待下一条消息
 
-    async def cleanup(self):
+    async def cleanup(self, session_id: Optional[str] = None):
         """
-        清理资源：终止进程、归档会话
-        在会话结束或 handover 时调用
+        清理资源：终止进程
+
+        Phase 2 多租户隔离：
+        - session_id=None: 清理所有进程（全局清理）
+        - session_id=xxx: 只清理指定 session 的进程（局部清理）
+
+        Args:
+            session_id: 要清理的 session ID，None 表示清理所有
         """
-        async with self._lock:
-            if self.process and self.process.returncode is None:
-                try:
-                    self.process.terminate()
-                    await asyncio.wait_for(self.process.wait(), timeout=5.0)
-                except asyncio.TimeoutError:
-                    self.process.kill()
-                    await self.process.wait()
-                except Exception:
-                    pass
-            self.process = None
-            self._is_interactive = False
+        if session_id:
+            # 清理特定 session
+            sessions_to_clean = [session_id]
+        else:
+            # 清理所有 session
+            sessions_to_clean = list(self._processes.keys())
+
+        for sid in sessions_to_clean:
+            lock = await self._get_session_lock(sid)
+            async with lock:
+                process = self._processes.get(sid)
+                if process and process.returncode is None:
+                    try:
+                        process.terminate()
+                        await asyncio.wait_for(process.wait(), timeout=5.0)
+                        print(f"[DEBUG] 清理进程 PID={process.pid}, cat_id={self.cat_id}, session_id={sid}")
+                    except asyncio.TimeoutError:
+                        process.kill()
+                        await process.wait()
+                    except Exception:
+                        pass
+                # 从字典中删除
+                if sid in self._processes:
+                    del self._processes[sid]
+                if sid in self._locks:
+                    del self._locks[sid]
 
     def _format_tool_call(self, tool: dict) -> str:
         """格式化工具调用为友好显示"""
@@ -588,23 +639,17 @@ class CatAgent:
         """
         群聊模式：基于完整上下文生成回复
 
-        Phase 1 升级：
-        - use_interactive=True: 使用新的交互式模式
-        - use_interactive=False: 使用原有的单次调用模式
+        Phase 2 多租户隔离：
+        - session_id 直接传递给 send_message，不再修改实例属性
+        - 每个 Chainlit thread 使用独立的 CLI 进程
         """
         prompt = self._build_group_prompt(session_id)
 
-        # 更新 session_id 用于会话管理（必须是有效 UUID）
-        # 基于 Chainlit session_id 生成确定性 UUID
-        if session_id != "default":
-            # 使用 UUID5 基于 session_id 生成确定性 UUID
-            self.session_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"meow-{self.cat_id}-{session_id}"))
-
         if use_interactive:
-            # Phase 1: 使用新的交互式模式
+            # Phase 2: 传递 session_id 实现进程隔离
             full = ""
             try:
-                async for chunk in self.send_message(prompt, cwd):
+                async for chunk in self.send_message(prompt, session_id, cwd):
                     full += chunk
                 return full
             except FileNotFoundError:
@@ -647,22 +692,16 @@ class CatAgent:
         群聊模式的流式输出版本
         支持 stream-json 格式，显示工具调用进度和流式文本
 
-        Phase 1 升级：
-        - use_interactive=True: 使用新的交互式模式（支持 --resume 会话恢复）
-        - use_interactive=False: 使用原有的单次调用模式
+        Phase 2 多租户隔离：
+        - session_id 直接传递给 send_message，不再修改实例属性
+        - 每个 Chainlit thread 使用独立的 CLI 进程
         """
         prompt = self._build_group_prompt(session_id)
 
-        # 更新 session_id 用于会话管理（必须是有效 UUID）
-        # 基于 Chainlit session_id 生成确定性 UUID
-        if session_id != "default":
-            # 使用 UUID5 基于 session_id 生成确定性 UUID
-            self.session_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"meow-{self.cat_id}-{session_id}"))
-
         if use_interactive:
-            # Phase 1: 使用新的交互式模式
+            # Phase 2: 传递 session_id 实现进程隔离
             try:
-                async for chunk in self.send_message(prompt, cwd):
+                async for chunk in self.send_message(prompt, session_id, cwd):
                     yield chunk
                 return
             except FileNotFoundError:

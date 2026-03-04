@@ -24,6 +24,14 @@ from memory import (
     delete_session as db_delete_session,
 )
 
+
+async def cleanup_cat_processes(thread_id: str):
+    """清理指定 thread 对应的所有猫猫进程"""
+    # 延迟导入避免循环依赖
+    from cats import ALL_CATS
+    for cat in ALL_CATS:
+        await cat.cleanup(thread_id)
+
 _executor = ThreadPoolExecutor(max_workers=4)
 
 DEFAULT_USER_ID = "default_user"
@@ -166,7 +174,11 @@ class MeowDevDataLayer(BaseDataLayer):
         await self._run_sync(_update)
 
     async def delete_thread(self, thread_id: str):
+        # 先清理对应的猫猫进程
+        await cleanup_cat_processes(thread_id)
+        # 再删除数据库记录
         await self._run_sync(db_delete_session, thread_id)
+        print(f"[MeowDev] 删除 thread {thread_id}，已清理对应进程")
 
     async def list_threads(
         self, pagination: Pagination, filters: ThreadFilter

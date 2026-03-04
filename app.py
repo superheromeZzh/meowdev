@@ -123,9 +123,11 @@ async def on_chat_resume(thread: dict):
 @cl.on_stop
 async def on_stop():
     cl.user_session.set("should_stop", True)
-    # Phase 1: 清理猫猫资源
-    for cat in ALL_CATS:
-        await cat.cleanup()
+    # Phase 2: 只清理当前 session 的进程，不影响其他 session
+    session_id = cl.user_session.get("session_id")
+    if session_id:
+        for cat in ALL_CATS:
+            await cat.cleanup(session_id)
 
 
 def _ensure_session(session_id: str):
